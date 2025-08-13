@@ -1,0 +1,10 @@
+{
+  "bidntcenm": {
+    "use": true,
+    "embedding_model": "sentence-transformers/monologg-koelectra-base-v3-discriminator",
+    "max_length": 32,
+    "normalize": true,
+    "add_flag": true,
+    "null_strategy": "empty"
+  }
+}

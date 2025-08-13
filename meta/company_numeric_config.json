@@ -1,0 +1,12 @@
+{
+  "totprdprcnum": {
+    "fill": "median",
+    "log1p": false,
+    "scale": "none",
+    "add_flag": true,
+    "clip_abs": [
+      0.0,
+      1000000.0
+    ]
+  }
+}
