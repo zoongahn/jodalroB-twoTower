@@ -1,0 +1,250 @@
+{
+  "totprdprcnum": {
+    "fill": "mode",
+    "log1p": false,
+    "scale": "none",
+    "add_flag": true
+  },
+  "drwtprdprcnum": {
+    "fill": "mode",
+    "log1p": false,
+    "scale": "none",
+    "add_flag": true,
+    "clip": [
+      0.5,
+      99.5
+    ]
+  },
+  "bdgtamt": {
+    "fill": "median",
+    "log1p": true,
+    "scale": "zscore",
+    "add_flag": true,
+    "clip": [
+      0.5,
+      99.5
+    ]
+  },
+  "presmptprce": {
+    "fill": "median",
+    "log1p": true,
+    "scale": "zscore",
+    "add_flag": true,
+    "clip": [
+      0.5,
+      99.5
+    ]
+  },
+  "govsplyamt": {
+    "fill": "median",
+    "log1p": true,
+    "scale": "zscore",
+    "add_flag": true,
+    "clip": [
+      0.5,
+      99.5
+    ]
+  },
+  "indstrytyevlrt": {
+    "fill": 0,
+    "log1p": false,
+    "scale": "none",
+    "add_flag": true,
+    "clip_abs": [
+      0.0,
+      100.0
+    ]
+  },
+  "maincnsttycnstwkprearngamt": {
+    "fill": 0,
+    "log1p": true,
+    "scale": "zscore",
+    "add_flag": true,
+    "clip": [
+      0.5,
+      99.5
+    ]
+  },
+  "contrctrcnstrtngovsplymtrlamt": {
+    "fill": 0,
+    "log1p": true,
+    "scale": "zscore",
+    "add_flag": true,
+    "clip": [
+      0.5,
+      99.5
+    ]
+  },
+  "govcnstrtngovsplymtrlamt": {
+    "fill": "median",
+    "log1p": true,
+    "scale": "zscore",
+    "add_flag": true,
+    "clip": [
+      0.5,
+      99.5
+    ]
+  },
+  "sucsfbidlwltrate": {
+    "fill": 87.745,
+    "log1p": false,
+    "scale": "none",
+    "add_flag": true,
+    "clip_abs": [
+      0.0,
+      100.0
+    ]
+  },
+  "bssamt": {
+    "fill": "median",
+    "log1p": true,
+    "scale": "zscore",
+    "add_flag": true,
+    "clip": [
+      0.5,
+      99.5
+    ]
+  },
+  "rsrvtnprcerngbgnrate": {
+    "fill": "mode",
+    "log1p": false,
+    "scale": "none",
+    "add_flag": true,
+    "clip_abs": [
+      -10.0,
+      0.0
+    ],
+    "clip_to_null" : true
+  },
+  "rsrvtnprcerngendrate": {
+    "fill": "mode",
+    "log1p": false,
+    "scale": "none",
+    "add_flag": true,
+    "clip_abs": [
+      0.0,
+      10.0
+    ],
+    "clip_to_null" : true
+  },
+  "evlbssamt": {
+    "fill": 0,
+    "log1p": true,
+    "scale": "zscore",
+    "add_flag": true
+  },
+  "dfcltydgrcfcnt": {
+    "fill": 0,
+    "log1p": true,
+    "scale": "zscore",
+    "add_flag": true,
+    "clip_abs": [
+      0.0,
+      1.0
+    ]
+  },
+  "etcgnrlexpnsbssrate": {
+    "fill": 0,
+    "log1p": false,
+    "scale": "none",
+    "add_flag": true,
+    "clip_abs": [
+      0.0,
+      100.0
+    ],
+    "clip_to_null": true
+  },
+  "gnrlmngcstbssrate": {
+    "fill": 0,
+    "log1p": false,
+    "scale": "none",
+    "add_flag": true,
+    "clip_abs": [
+      0.0,
+      100.0
+    ],
+    "clip_to_null": true
+  },
+  "prtfbssrate": {
+    "fill": 0,
+    "log1p": false,
+    "scale": "none",
+    "add_flag": true,
+    "clip_abs": [
+      0.0,
+      100.0
+    ],
+    "clip_to_null": true
+  },
+  "lbrcstbssrate": {
+    "fill": 0,
+    "log1p": false,
+    "scale": "none",
+    "add_flag": true,
+    "clip_abs": [
+      0.0,
+      100.0
+    ],
+    "clip_to_null": true
+  },
+  "sftymngcst": {
+    "fill": 0,
+    "log1p": true,
+    "scale": "zscore",
+    "add_flag": true
+  },
+  "sftychckmngcst": {
+    "fill": 0,
+    "log1p": true,
+    "scale": "zscore",
+    "add_flag": true
+  },
+  "rtrfundnon": {
+    "fill": 0,
+    "log1p": true,
+    "scale": "zscore",
+    "add_flag": true
+  },
+  "envcnsrvcst": {
+    "fill": 0,
+    "log1p": true,
+    "scale": "zscore",
+    "add_flag": true
+  },
+  "scontrctpayprcepaygrntyfee": {
+    "fill": 0,
+    "log1p": true,
+    "scale": "zscore",
+    "add_flag": true
+  },
+  "mrfnhealthinsrprm": {
+    "fill": 0,
+    "log1p": true,
+    "scale": "zscore",
+    "add_flag": true
+  },
+  "npninsrprm": {
+    "fill": 0,
+    "log1p": true,
+    "scale": "zscore",
+    "add_flag": true
+  },
+  "odsnlngtrmrcprinsrprm": {
+    "fill": 0,
+    "log1p": true,
+    "scale": "zscore",
+    "add_flag": true
+  },
+  "bssamtpurcnstcst": {
+    "fill": 0,
+    "log1p": true,
+    "scale": "zscore",
+    "add_flag": true
+  },
+  "qltymngcst": {
+    "fill": 0,
+    "log1p": true,
+    "scale": "zscore",
+    "add_flag": true
+    }
+}

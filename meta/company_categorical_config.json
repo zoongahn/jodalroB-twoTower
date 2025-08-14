@@ -1,0 +1,8 @@
+{
+    "rgncd": { "encoding_method": "label", "add_flag": true, "null_strategy": "new_category" },
+    "rgnnm": { "encoding_method": "label", "add_flag": true, "null_strategy": "new_category" },
+    "cntrynm": { "encoding_method": "label", "add_flag": true, "null_strategy": "new_category" },
+    "mnfctdivnm": { "encoding_method": "label", "add_flag": true, "null_strategy": "new_category" },
+    "corpbsnsdivcd": { "encoding_method": "label", "add_flag": true, "null_strategy": "new_category" },
+    "hdoffcedivnm": { "encoding_method": "label", "add_flag": true, "null_strategy": "new_category" }
+} 
