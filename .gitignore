@@ -207,3 +207,8 @@ venv/
 
 
 # End of https://www.toptal.com/developers/gitignore/api/pycharm,visualstudiocode,macos,windows
+
+
+output/
+parquet/
+__pycache__/

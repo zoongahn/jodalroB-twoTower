@@ -195,7 +195,8 @@ class TextPreprocessor:
 
             # 열 확장
             for d in range(embs.shape[1]):
-                out_dict[f"{col}_emb{d:03d}"] = pd.Series(embs[:, d], index=df.index, dtype="float32")
+                col_name = f"{col}_emb{d:03d}"
+                out_dict[col_name] = pd.Series(embs[:, d], index=df.index, dtype="float32", name=col_name)
 
         # 원래 순서 우선 + 새 열 뒤에
         out_df = pd.DataFrame({c: out_dict[c] for c in original_order if c in out_dict})
@@ -260,8 +261,6 @@ if __name__ == "__main__":
     pre = TextPreprocessor(cfg, table_pk_map=TABLE_PK_MAP)
     pre.fit(work, table_name=table_name)
     out = pre.transform(work, table_name=table_name).rename(columns=str)
-
-    print(out)
 
 
     def _order_key(prefix, label):

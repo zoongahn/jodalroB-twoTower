@@ -86,6 +86,9 @@ class CategoricalPreprocessor:
         for pk in pk_cols:
             if pk in df.columns:
                 df_out[pk] = df[pk]
+                
+        processed_cols = []
+        null_flag_cols = []
 
         for col in df.columns:
             if col not in self.cfg or col in pk_cols:
@@ -95,7 +98,9 @@ class CategoricalPreprocessor:
             col_data = df[col].copy().astype(str)
             
             # 1. 결측값 플래그 (모델에게 결측 정보를 명시적으로 알려주는 것은 중요한 피처가 될 수 있음)
-            df_out[f'{col}_is_null'] = df[col].isnull().astype('float32')
+            null_flag_col = f"{col}_is_null"
+            df_out[null_flag_col] = df[col].isnull().astype('float32')
+            null_flag_cols.append(null_flag_col)
             
             # 2. 결측값 토큰화
             col_data.fillna(NULL_TOKEN, inplace=True)
@@ -107,6 +112,9 @@ class CategoricalPreprocessor:
 
             # map에 없는 새로운 값은 모두 unknown_idx로 대체
             df_out[col] = col_data.map(mapping).fillna(unknown_idx).astype(int)
+            processed_cols.append(col)
+            
+        df_out = df_out[pk_cols+processed_cols+null_flag_cols]
 
         return df_out
 
@@ -170,24 +178,7 @@ if __name__ == '__main__':
     try:
         table_name = "notice"
         json_config_path = "meta/notice_categorical_config.json"
-        
-        # 샘플 설정 파일 생성
-        if not Path(json_config_path).exists():
-            sample_cfg = {
-                "bidmethdnm": {
-                    "encoding_method": "label",
-                    "add_flag": True,
-                    "null_strategy": "new_category"
-                },
-                "cntrctcnclsmthdnm": {
-                    "encoding_method": "label",
-                     "null_strategy": "mode"
-                }
-            }
-            with open(json_config_path, 'w', encoding='utf-8') as f:
-                json.dump(sample_cfg, f, indent=2)
-            print(f"📝 샘플 설정 파일 생성: {json_config_path}")
-
+ 
         df = pd.read_csv("output/multiple/multiple_notices.csv")
         
         config = load_config(json_config_path)
@@ -205,12 +196,12 @@ if __name__ == '__main__':
         
         result = preprocess_categorical_data(df[process_cols], table_name)
         
-        print("\\n✅ 전처리 후 데이터:")
+        print("\n✅ 전처리 후 데이터:")
         print(result.head())
         
         output_path = "output/preprocessed/notice_categorical_test.csv"
         result.to_csv(output_path, index=False, encoding='utf-8-sig')
-        print(f"\\n📁 테스트 결과 저장: {output_path}")
+        print(f"\n📁 테스트 결과 저장: {output_path}")
 
     except Exception as e:
         print(f"❌ 테스트 실패: {e}")

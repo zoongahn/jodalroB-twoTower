@@ -165,7 +165,7 @@
     ],
     "clip_to_null": true
   },
-  "prtfbssrate": {
+  "prftbssrate": {
     "fill": 0,
     "log1p": false,
     "scale": "none",

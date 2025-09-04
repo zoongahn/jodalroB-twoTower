@@ -61,7 +61,7 @@ class NumericPreprocessor:
                 self.stats[col]['fill_value'] = 0
 
             # 결측값 채우기 (통계 계산을 위해)
-            col_data = col_data.fillna(self.stats[col]['fill_value'])
+            col_data = pd.to_numeric(col_data, errors="coerce").fillna(self.stats[col]['fill_value'])
 
             # 2. 클리핑 경계 계산
             if 'clip' in col_cfg:  # 백분위수 기반
@@ -71,6 +71,7 @@ class NumericPreprocessor:
             elif 'clip_abs' in col_cfg:  # 절대값 기반
                 self.stats[col]['clip_low'] = col_cfg['clip_abs'][0]
                 self.stats[col]['clip_high'] = col_cfg['clip_abs'][1]
+                
 
             # 클리핑 적용 (log1p, scale 계산을 위해)
             if 'clip_low' in self.stats[col]:
@@ -156,7 +157,7 @@ class NumericPreprocessor:
                 processed[f'{col}_is_null'] = col_data.isnull().astype('float32')
 
             # 2. 결측값 채우기
-            col_data = col_data.fillna(col_stats['fill_value'])
+            col_data = pd.to_numeric(col_data, errors="coerce").fillna(col_stats['fill_value'])
 
             # 3. 클리핑
             if 'clip_low' in col_stats:

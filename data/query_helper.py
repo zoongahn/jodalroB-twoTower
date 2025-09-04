@@ -3,6 +3,7 @@ from typing import Dict, List, Tuple, Optional, Any
 import pandas as pd
 from data.database_connector import DatabaseConnector
 import traceback
+from sqlalchemy import inspect, text
 
 
 class QueryHelper:
@@ -215,13 +216,6 @@ class QueryHelper:
         return self.get_rows_by_pk('company', pk_tuples, columns)
 
 
-    def get_notice_summary(self, notice_ids: List[Tuple[str, str]]) -> pd.DataFrame:
-        """
-        공고들의 요약 정보 조회 (주요 컬럼만)
-        """
-        summary_columns = [self.table_pk_map['notice'][0], self.table_pk_map['notice'][1], 'bidnm', 'bdgtamt', 'rgstdt', 'bidclsdt']
-        return self.get_notice_by_ids(notice_ids, summary_columns)
-
     def get_bid_participants(self, notice_id: Tuple[str, str]) -> pd.DataFrame:
         """
         특정 공고의 참여 업체 목록 조회
@@ -306,33 +300,6 @@ class QueryHelper:
             print(f"❌ 최근 공고 조회 실패: {e}")
             return pd.DataFrame()
 
-
-    def get_high_budget_notices(self, min_budget: int = 1000000000, limit: int = 100) -> pd.DataFrame:
-        """
-        고액 공고 조회 (예산 기준)
-
-        Args:
-            min_budget: 최소 예산 (기본 10억)
-            limit: 최대 조회 개수
-        """
-        query = f"""
-        SELECT *
-        FROM {self.table_names['notice']}
-        WHERE bssamt >= {min_budget}
-        ORDER BY bssamt DESC
-        LIMIT {limit}
-        """
-
-        print(f"🔄 {min_budget:,}원 이상 고액 공고 조회 중...")
-
-        try:
-            df = self.db_connector.execute_query(query)
-            print(f"✅ 고액 공고 조회 완료: {len(df)}건")
-            return df
-        except Exception as e:
-            print(f"❌ 고액 공고 조회 실패: {e}")
-            return pd.DataFrame()
-
     def count_table_rows(self, table_name: str) -> int:
         """테이블 총 행 수 조회"""
         try:
@@ -346,19 +313,70 @@ class QueryHelper:
             print(f"❌ {table_name} 행 수 조회 실패: {e}")
             return 0
 
-    def get_table_sample(self, table_name: str, sample_size: int = 10) -> pd.DataFrame:
-        """테이블 샘플 데이터 조회"""
+    def get_all_with_use_columns(
+        self,
+        table_name: str,
+        where_clause: Optional[str] = None,
+        order_by: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> pd.DataFrame:
         try:
-            table_name_actual = self.table_names[table_name]
-            query = f"SELECT * FROM {table_name_actual} LIMIT {sample_size}"
+            # 1) 실제 테이블명/유즈컬럼 테이블명
+            if table_name not in self.table_names:
+                print(f"❌ 지원하지 않는 테이블 키: {table_name}")
+                return pd.DataFrame()
+
+            # 1) SELECT 절 결정 (이미 빌드된 멤버 사용)
+            if table_name == 'notice':
+                select_expr = self.notice_select  # 예: "*", "col1, col2, ..."
+            elif table_name == 'company':
+                select_expr = self.company_select
+            else:  # 'bid' 등은 항상 전체 컬럼
+                select_expr = "*"
+
+            data_table = self.table_names[table_name]
+
+             # 2) 본문 쿼리 조립
+            query = f"SELECT {select_expr} FROM {data_table}"
+            if where_clause and where_clause.strip():
+                query += f" WHERE {where_clause.strip()}"
+            if order_by and order_by.strip():
+                query += f" ORDER BY {order_by.strip()}"
+            if isinstance(limit, int) and limit > 0:
+                query += f" LIMIT {limit}"
+
+            print(f"🔄 {data_table} 테이블 조회 (use_column SELECT 적용) ...")
             df = self.db_connector.execute_query(query)
-            print(f"📄 {table_name_actual} 샘플 데이터: {len(df)}행")
+            print(f"✅ 조회 완료: {len(df)}행")
             return df
+
         except Exception as e:
-            print(f"❌ {table_name} 샘플 조회 실패: {e}")
+            print(f"❌ get_all_with_use_columns 실패: {e}")
             return pd.DataFrame()
+        
+    # ✔ use columns SELECT 생성 (텍스트 컬럼 제외 가능)
+    def get_use_columns_select(self, table_name: str, exclude_text_cols: list[str] | None = None) -> str:
+        exclude_text_cols = set(exclude_text_cols or [])
+        # 너의 기존 "use 컬럼" 리스트를 가져오는 로직이 있다면 그걸 재사용하세요.
+        # 없으면 전체 컬럼에서 제외만 반영:
+        insp = inspect(self.db_connector.engine)
+        cols = [c["name"] for c in insp.get_columns(table_name, schema="public")]
+        use_cols = [c for c in cols if c not in exclude_text_cols]
+        col_list = ", ".join(f'"{c}"' for c in use_cols)
+        return f'SELECT {col_list} FROM "public"."{table_name}"'
 
+    # ✔ COUNT (SELECT와 동일 조건/조인 반영해줘야 정확)
+    def get_use_columns_count(self, table_name: str, exclude_text_cols: list[str] | None = None) -> str:
+        # 필터/조인이 있다면 동일하게 반영해야 함 (여기선 테이블 전체 기준)
+        return f'SELECT COUNT(*) FROM "public"."{table_name}"'
 
+    # ✔ PK+TEXT 최소 SELECT
+    def select_pk_and_text(self, table_name: str, pk_cols: list[str], text_col: str) -> str:
+        cols = ", ".join(f'"{c}"' for c in [*pk_cols, text_col])
+        return f'SELECT {cols} FROM "public"."{table_name}"'
+    
+    
+    
 # 사용 예시
 def test_query_helper():
     """QueryHelper 테스트"""
