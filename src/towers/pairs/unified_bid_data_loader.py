@@ -10,6 +10,71 @@ from src.torchrec_preprocess.schema import TorchRecSchema
 from src.torchrec_preprocess.torchrec_inputs import slice_and_convert_for_tower
 from src.torchrec_preprocess.feature_store import build_feature_store, build_feature_store_with_condition
 from src.torchrec_preprocess.feature_projector import FeatureProjector
+from src.torchrec_preprocess.feature_preprocessor import FeaturePreprocessor
+from torchrec import KeyedJaggedTensor
+from data.database_connector import DatabaseConnector
+
+
+def _build_single_kjt(cat_single: torch.Tensor, keys: List[str]) -> KeyedJaggedTensor:
+    """개별 샘플용 KJT 생성"""
+    from torchrec import KeyedJaggedTensor
+    assert len(cat_single.shape) == 1 and cat_single.shape[0] == len(keys)
+    
+    values = cat_single
+    lengths = torch.ones(len(keys), dtype=torch.int32)
+    
+    return KeyedJaggedTensor.from_lengths_sync(
+        keys=keys,
+        values=values,
+        lengths=lengths
+    )
+
+def _combine_kjts(kjt_list: List[KeyedJaggedTensor]) -> KeyedJaggedTensor:
+    """KJT 리스트를 배치로 결합"""
+    from torchrec import KeyedJaggedTensor
+    
+    if not kjt_list:
+        raise ValueError("Empty KJT list")
+    
+    # 모든 KJT가 같은 키를 가져야 함
+    keys = kjt_list[0].keys()
+    
+    # 모든 values와 lengths를 결합
+    all_values = []
+    all_lengths = []
+    
+    for kjt in kjt_list:
+        all_values.append(kjt.values())
+        all_lengths.append(kjt.lengths())
+    
+    combined_values = torch.cat(all_values)
+    combined_lengths = torch.cat(all_lengths)
+    
+    return KeyedJaggedTensor.from_lengths_sync(
+        keys=keys,
+        values=combined_values,
+        lengths=combined_lengths
+    )
+
+def _build_batch_kjt(cat_batch: torch.Tensor, keys: List[str]) -> KeyedJaggedTensor:
+    """배치 단위로 KJT 생성 (벡터화)"""
+    B, K = cat_batch.shape
+    assert K == len(keys), f"Keys length {len(keys)} doesn't match tensor shape {K}"
+    
+    # 모든 값을 flatten
+    values = cat_batch.reshape(-1)
+    
+    # 각 항목은 길이 1
+    lengths = torch.ones(B * K, dtype=torch.int32)
+    
+    # 키를 B번 반복
+    repeated_keys = keys * B
+    
+    return KeyedJaggedTensor.from_lengths_sync(
+        keys=repeated_keys,
+        values=values,
+        lengths=lengths
+    )
 
 
 class UnifiedBidDataset(Dataset):
@@ -53,6 +118,8 @@ class UnifiedBidDataset(Dataset):
         self.feature_chunksize = feature_chunksize
         self.feature_limit = feature_limit
         self.shared_feature_stores = shared_feature_stores
+        self.preprocessed_stores = None  # 전처리된 스토어 저장용
+        self._worker_id = None  # 워커 ID 추적
         
         print(f"UnifiedBidDataset 초기화... (train={is_train}, streaming={streaming}, load_all_features={load_all_features})")
         
@@ -70,10 +137,19 @@ class UnifiedBidDataset(Dataset):
         if load_all_features:
             if shared_feature_stores is not None:
                 print("공유 피처 스토어 사용")
-                self.notice_store = shared_feature_stores['notice']
-                self.company_store = shared_feature_stores['company']
-                self._build_id_mappings(self.notice_store, self.company_store)
-                self._setup_projectors()
+                # Preprocessed stores를 사용하는 경우
+                if 'preprocessed' in shared_feature_stores:
+                    print("  - Preprocessed 스토어 사용")
+                    self.preprocessed_stores = shared_feature_stores['preprocessed']
+                    self.notice_store = self.preprocessed_stores['notice']
+                    self.company_store = self.preprocessed_stores['company']
+                    self._build_id_mappings(self.notice_store, self.company_store)
+                else:
+                    # 기존 방식 (raw stores)
+                    self.notice_store = shared_feature_stores['notice']
+                    self.company_store = shared_feature_stores['company']
+                    self._build_id_mappings(self.notice_store, self.company_store)
+                    self._setup_projectors()
             else:
                 print("개별 피처 스토어 로딩")
                 self._load_all_features()
@@ -146,16 +222,28 @@ class UnifiedBidDataset(Dataset):
         
         if test_split == 0:
             return pairs_df
-            
-        n_total = len(pairs_df)
-        n_test = int(n_total * test_split)
+    
+    def _ensure_db_connection(self):
+        """워커별 DB 연결 확인 및 재생성"""
+        # 워커 프로세스에서만 실행
+        import torch.utils.data
+        worker_info = torch.utils.data.get_worker_info()
         
-        if self.is_train:
-            pairs_df = pairs_df[n_test:].reset_index(drop=True)
-        else:
-            pairs_df = pairs_df[:n_test].reset_index(drop=True)
-            
-        return pairs_df
+        if worker_info is not None:
+            # 워커 프로세스인 경우
+            if self._worker_id != worker_info.id:
+                # 새 워커이거나 아직 연결이 없는 경우
+                self._worker_id = worker_info.id
+                
+                # 기존 연결 종료
+                if hasattr(self, 'db_engine'):
+                    try:
+                        self.db_engine.dispose()
+                    except:
+                        pass
+                
+                # 단일 프로세스 모드에서는 DB 재연결 불필요
+                # print("단일 프로세스 모드: DB 재연결 생략")  # 로그 제거
     
     def _load_all_features(self):
         """모든 피처 미리 로딩"""
@@ -266,8 +354,11 @@ class UnifiedBidDataset(Dataset):
         """인덱스로부터 청크 ID 계산"""
         return idx // self.chunk_size
     
-    def _load_chunk(self, chunk_id: int) -> pd.DataFrame:
-        """청크 로딩 (스트리밍 모드)"""
+    def _load_chunk(self, chunk_id: int) -> Dict[str, np.ndarray]:
+        """청크 로딩 (스트리밍 모드) - NumPy 배열로 반환"""
+        # DB 연결 확인 (워커별 연결)
+        self._ensure_db_connection()
+        
         start_idx = chunk_id * self.chunk_size
         
         if self.is_train:
@@ -287,7 +378,14 @@ class UnifiedBidDataset(Dataset):
             OFFSET {start_idx} LIMIT {self.chunk_size}
             """
         
-        return pd.read_sql(query, self.db_engine)
+        chunk_df = pd.read_sql(query, self.db_engine)
+        # DataFrame을 NumPy 배열로 변환하여 반환
+        return {
+            'bidntceno': chunk_df['bidntceno'].values,
+            'bidntceord': chunk_df['bidntceord'].values,
+            'bizno': chunk_df['bizno'].values,
+            'id': chunk_df['id'].values
+        }
     
     def _get_pair_data(self, idx: int) -> pd.Series:
         """pair 데이터 조회 (streaming/static 모드 통합)"""
@@ -303,12 +401,14 @@ class UnifiedBidDataset(Dataset):
                     if not self.load_all_features and oldest_chunk in self.feature_cache:
                         del self.feature_cache[oldest_chunk]
                 
-                # 새 청크 로딩
-                chunk_df = self._load_chunk(chunk_id)
-                self.chunk_cache[chunk_id] = chunk_df
+                # 새 청크 로딩 (NumPy 배열)
+                chunk_arrays = self._load_chunk(chunk_id)
+                self.chunk_cache[chunk_id] = chunk_arrays
                 
                 # 선택적 피처 로딩 (streaming + selective 모드)
                 if not self.load_all_features:
+                    # chunk_arrays를 DataFrame으로 변환하여 전달
+                    chunk_df = pd.DataFrame(chunk_arrays)
                     notice_store, company_store = self._load_selective_features_for_chunk(chunk_df)
                     self.feature_cache[chunk_id] = {
                         'notice_store': notice_store,
@@ -320,14 +420,19 @@ class UnifiedBidDataset(Dataset):
                         }
                     }
             
-            # 청크 내 인덱스 계산
-            chunk_df = self.chunk_cache[chunk_id]
+            # 청크 내 인덱스 계산 (NumPy 배열에서 직접 접근)
+            chunk_arrays = self.chunk_cache[chunk_id]
             local_idx = idx % self.chunk_size
             
-            if local_idx >= len(chunk_df):
+            if local_idx >= len(chunk_arrays['bidntceno']):
                 raise IndexError(f"Index {idx} out of range")
             
-            return chunk_df.iloc[local_idx], chunk_id
+            # NumPy 배열에서 직접 값 추출
+            return {
+                'bidntceno': chunk_arrays['bidntceno'][local_idx],
+                'bidntceord': chunk_arrays['bidntceord'][local_idx],
+                'bizno': chunk_arrays['bizno'][local_idx]
+            }, chunk_id
         else:
             # 정적 모드
             return self.pairs.iloc[idx], None
@@ -336,198 +441,500 @@ class UnifiedBidDataset(Dataset):
         return self.total_count
     
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        """통합 배치 아이템 반환 - 성능 최적화"""
+        """단순화된 아이템 반환 - load_all_features=True, streaming=True 전용"""
         if idx >= self.total_count:
             raise IndexError(f"Index {idx} out of range (total: {self.total_count})")
         
-        # 하이브리드 모드 최적화: 피처가 미리 로드되어 있으면 Fast path 사용
-        if self.load_all_features and hasattr(self, 'notice_store') and hasattr(self, 'company_store'):
-            # Fast path for hybrid mode (load_all_features=True)
-            # 피쳐는 메모리, 페어는 필요시 로드(청크 마다)
-            if self.streaming:
-                # 청크 체크 (실제로 새 청크일 때만 DB 엑세스)
-                chunk_id = self._get_chunk_id(idx)
-                if chunk_id not in self.chunk_cache:
-                    chunk_df = self._load_chunk(chunk_id)
-                    self.chunk_cache[chunk_id] = chunk_df
-                    print(f"청크 {chunk_id} 로딩 완료") # 실제 청크 로드 확인용
-                    
-                # 청크 캐시에서 빠른 조회
-                local_idx = idx % self.chunk_size
-                pair = self.chunk_cache[chunk_id].iloc[local_idx]
-                
-            else:
-                # 완전 static 모드
-                pair = self.pairs.iloc[idx]
-                
-            bidntceno = pair['bidntceno']
-            bidntceord = pair['bidntceord'] 
-            bizno = str(pair['bizno'])
+        # 청크에서 pair 데이터 조회
+        chunk_id = self._get_chunk_id(idx)
+        if chunk_id not in self.chunk_cache:
+            chunk_arrays = self._load_chunk(chunk_id)
+            self.chunk_cache[chunk_id] = chunk_arrays
+            # print(f"청크 {chunk_id} 로딩 완료")  # 로그 제거 (워커별 중복 출력 방지)
             
-            # 미리 로드된 인덱스 맵에서 빠른 조회
-            notice_key = (bidntceno, bidntceord)
-            company_key = bizno
-            
-            notice_idx = self.notice_id_to_idx.get(notice_key, 0)
-            company_idx = self.company_id_to_idx.get(company_key, 0)
-            
-            # 피처 추출 (미리 로드된 스토어 사용)
-            notice_input = slice_and_convert_for_tower(
-                store_result=self.notice_store,
-                row_idx=[notice_idx],
-                categorical_keys=self.schema.notice.categorical,
-                text_cols=self.schema.notice.text,
-                projector=self.notice_projector,
-                fuse_projected=True
-            )
-            
-            company_input = slice_and_convert_for_tower(
-                store_result=self.company_store,
-                row_idx=[company_idx], 
-                categorical_keys=self.schema.company.categorical,
-                text_cols=self.schema.company.text,
-                projector=self.company_projector,
-                fuse_projected=True
-            )
-            
-            return {
-                "notice": {"dense": notice_input["dense"], "kjt": notice_input["kjt"]},
-                "company": {"dense": company_input["dense"], "kjt": company_input["kjt"]},
-                "pair_info": {"bidntceno": bidntceno, "bidntceord": bidntceord, "bizno": bizno}
-            }
-
+        # 청크 캐시에서 빠른 조회
+        local_idx = idx % self.chunk_size
+        chunk_arrays = self.chunk_cache[chunk_id]
+        bidntceno = chunk_arrays['bidntceno'][local_idx]
+        bidntceord = chunk_arrays['bidntceord'][local_idx]
+        bizno = str(chunk_arrays['bizno'][local_idx])
         
-        # 완전 스트리밍 모드 (load_all_features=False, streaming=True)      
-        else:
-            pair, chunk_id = self._get_pair_data(idx)
-            bidntceno = pair['bidntceno']
-            bidntceord = pair['bidntceord']
-            bizno = str(pair['bizno'])
-            
-            # 피처 스토어 및 매핑 결정
-            if self.load_all_features:
-                notice_store = self.notice_store
-                company_store = self.company_store
-                notice_id_to_idx = self.notice_id_to_idx
-                company_id_to_idx = self.company_id_to_idx
-            else:
-                feature_data = self.feature_cache[chunk_id]
-                notice_store = feature_data['notice_store']
-                company_store = feature_data['company_store']
-                notice_id_to_idx = feature_data['notice_id_to_idx']
-                company_id_to_idx = feature_data['company_id_to_idx']
-            
-            # 인덱스 찾기
-            notice_key = (bidntceno, bidntceord)
-            if notice_key not in notice_id_to_idx:
-                print(f"WARNING: Notice ID {notice_key} not found, using index 0")
-                notice_idx = 0
-            else:
-                notice_idx = notice_id_to_idx[notice_key]
+        # 인덱스 조회
+        notice_key = (bidntceno, bidntceord)
+        company_key = bizno
+        
+        notice_idx = self.notice_id_to_idx.get(notice_key, 0)
+        company_idx = self.company_id_to_idx.get(company_key, 0)
+        
+        return {
+            "notice_idx": notice_idx,
+            "company_idx": company_idx,
+            "pair_info": {"bidntceno": bidntceno, "bidntceord": bidntceord, "bizno": bizno}
+        }
 
-            if bizno not in company_id_to_idx:
-                print(f"WARNING: Company ID {bizno} not found, using index 0")
-                company_idx = 0
-            else:
-                company_idx = company_id_to_idx[bizno]
+
+def create_collate_fn_original(dataset: 'UnifiedBidDataset'):
+    """원본 collate 함수 (백업용) - load_all_features=True, streaming=True 전용"""
+    from concurrent.futures import ThreadPoolExecutor
+    
+    def collate_fn(batch: List[Dict]) -> Dict[str, Dict[str, torch.Tensor]]:
+        # 배치에서 인덱스들 추출
+        notice_indices = [item["notice_idx"] for item in batch]
+        company_indices = [item["company_idx"] for item in batch]
+        
+        # 멀티스레딩으로 notice와 company 병렬 처리
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            # Notice 처리 함수
+            def process_notice():
+                notice_dense = torch.from_numpy(
+                    dataset.notice_store['dense_projected'][notice_indices]
+                ).float()
+                
+                notice_cat = dataset.notice_store['categorical'][notice_indices]
+                notice_kjt = _build_batch_kjt(
+                    torch.from_numpy(notice_cat).long(),
+                    dataset.schema.notice.categorical
+                )
+                return {"dense": notice_dense, "kjt": notice_kjt}
             
-            # 피처 추출
-            notice_input = slice_and_convert_for_tower(
-                store_result=notice_store,
-                row_idx=[notice_idx],
-                categorical_keys=self.schema.notice.categorical,
-                text_cols=self.schema.notice.text,
-                projector=self.notice_projector,
-                fuse_projected=True
+            # Company 처리 함수  
+            def process_company():
+                company_dense = torch.from_numpy(
+                    dataset.company_store['dense_projected'][company_indices]
+                ).float()
+                
+                company_cat = dataset.company_store['categorical'][company_indices]
+                company_kjt = _build_batch_kjt(
+                    torch.from_numpy(company_cat).long(),
+                    dataset.schema.company.categorical
+                )
+                return {"dense": company_dense, "kjt": company_kjt}
+            
+            # 병렬 실행
+            future_notice = executor.submit(process_notice)
+            future_company = executor.submit(process_company)
+            
+            # 결과 수집
+            notice_result = future_notice.result()
+            company_result = future_company.result()
+        
+        return {
+            "notice": notice_result,
+            "company": company_result
+        }
+    
+    return collate_fn
+
+
+def create_collate_fn_gpu(dataset: 'UnifiedBidDataset'):
+    """GPU 전용 collate 함수 (pin_memory=False 필요)"""
+    from concurrent.futures import ThreadPoolExecutor
+    
+    def collate_fn_gpu(batch: List[Dict]) -> Dict[str, Dict[str, torch.Tensor]]:
+        # 배치에서 인덱스들 추출
+        notice_indices = [item["notice_idx"] for item in batch]
+        company_indices = [item["company_idx"] for item in batch]
+        
+        # 멀티스레딩으로 notice와 company 병렬 처리
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            # Notice 처리 함수 (GPU 직접 전송)
+            def process_notice():
+                # Dense 데이터: GPU 직접 전송
+                notice_dense = torch.from_numpy(
+                    dataset.notice_store['dense_projected'][notice_indices]
+                ).float().cuda()
+                
+                # Categorical 데이터: GPU에서 KJT 생성
+                notice_cat = dataset.notice_store['categorical'][notice_indices]
+                notice_kjt = _build_batch_kjt_gpu(
+                    torch.from_numpy(notice_cat).long(),
+                    dataset.schema.notice.categorical
+                )
+                return {"dense": notice_dense, "kjt": notice_kjt}
+            
+            # Company 처리 함수 (GPU 직접 전송)
+            def process_company():
+                # Dense 데이터: GPU 직접 전송
+                company_dense = torch.from_numpy(
+                    dataset.company_store['dense_projected'][company_indices]
+                ).float().cuda()
+                
+                # Categorical 데이터: GPU에서 KJT 생성
+                company_cat = dataset.company_store['categorical'][company_indices]
+                company_kjt = _build_batch_kjt_gpu(
+                    torch.from_numpy(company_cat).long(),
+                    dataset.schema.company.categorical
+                )
+                return {"dense": company_dense, "kjt": company_kjt}
+            
+            # 병렬 실행
+            future_notice = executor.submit(process_notice)
+            future_company = executor.submit(process_company)
+            
+            # 결과 수집
+            notice_result = future_notice.result()
+            company_result = future_company.result()
+        
+        return {
+            "notice": notice_result,
+            "company": company_result
+        }
+    
+    return collate_fn_gpu
+
+
+def create_lightweight_collate_fn():
+    """
+    Lightweight collate function - 인덱스 추출만 담당
+    AsyncBatchPreprocessor와 함께 사용
+    """
+    def lightweight_collate_fn(batch: List[Dict]) -> List[Dict]:
+        # 단순히 배치 아이템들을 리스트로 반환
+        # 무거운 전처리는 AsyncBatchPreprocessor에서 담당
+        return batch
+    
+    return lightweight_collate_fn
+
+
+def create_collate_fn(dataset: 'UnifiedBidDataset'):
+    """GPU 최적화 collate 함수 - load_all_features=True, streaming=True 전용"""
+    from concurrent.futures import ThreadPoolExecutor
+    
+    def collate_fn_gpu_optimized(batch: List[Dict]) -> Dict[str, Dict[str, torch.Tensor]]:
+        # 배치에서 인덱스들 추출
+        notice_indices = [item["notice_idx"] for item in batch]
+        company_indices = [item["company_idx"] for item in batch]
+        
+        # 멀티스레딩으로 notice와 company 병렬 처리
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            # Notice 처리 함수 (GPU 최적화)
+            def process_notice():
+                # Dense 데이터: CPU에서 처리 후 나중에 GPU 이전
+                notice_dense = torch.from_numpy(
+                    dataset.notice_store['dense_projected'][notice_indices]
+                ).float()
+                
+                # Categorical 데이터: CPU에서 KJT 생성 (pin_memory 호환)
+                notice_cat = dataset.notice_store['categorical'][notice_indices]
+                notice_kjt = _build_batch_kjt(
+                    torch.from_numpy(notice_cat).long(),
+                    dataset.schema.notice.categorical
+                )
+                return {"dense": notice_dense, "kjt": notice_kjt}
+            
+            # Company 처리 함수 (GPU 최적화)
+            def process_company():
+                # Dense 데이터: CPU에서 처리 후 나중에 GPU 이전  
+                company_dense = torch.from_numpy(
+                    dataset.company_store['dense_projected'][company_indices]
+                ).float()
+                
+                # Categorical 데이터: CPU에서 KJT 생성 (pin_memory 호환)
+                company_cat = dataset.company_store['categorical'][company_indices]
+                company_kjt = _build_batch_kjt(
+                    torch.from_numpy(company_cat).long(),
+                    dataset.schema.company.categorical
+                )
+                return {"dense": company_dense, "kjt": company_kjt}
+            
+            # 병렬 실행
+            future_notice = executor.submit(process_notice)
+            future_company = executor.submit(process_company)
+            
+            # 결과 수집
+            notice_result = future_notice.result()
+            company_result = future_company.result()
+        
+        return {
+            "notice": notice_result,
+            "company": company_result
+        }
+    
+    return collate_fn_gpu_optimized
+
+
+def create_async_optimized_dataloaders(
+    db_engine,
+    schema,
+    batch_size: int = 32,
+    limit: Optional[int] = None,
+    test_split: float = 0.1,
+    shuffle_seed: int = 42,
+    pin_memory: bool = True,
+    streaming: bool = True,
+    chunk_size: int = 1000,
+    load_all_features: bool = True,
+    feature_chunksize: int = 5000,
+    feature_limit: Optional[int] = None,
+    use_preprocessor: bool = True
+) -> Tuple[DataLoader, DataLoader]:
+    """
+    AsyncBatchPreprocessor를 사용하는 최적화된 DataLoader
+    기존 create_unified_bid_dataloaders_gpu를 대체
+    """
+    from sqlalchemy.engine import Engine
+    
+    # 기존과 동일한 데이터 준비 로직
+    shared_stores = None
+    if load_all_features:
+        if use_preprocessor and streaming:
+            print("FeaturePreprocessor를 사용하여 피처 전처리 중...")
+            from src.torchrec_preprocess.feature_preprocessor import FeaturePreprocessor
+            
+            preprocessor = FeaturePreprocessor(
+                schema=schema,
+                device='cuda:0' if torch.cuda.is_available() else 'cpu',
+                num_proj_dim=128,
+                text_proj_dim=128,
+                batch_size=1024
             )
             
-            company_input = slice_and_convert_for_tower(
-                store_result=company_store,
-                row_idx=[company_idx],
-                categorical_keys=self.schema.company.categorical,
-                text_cols=self.schema.company.text,
-                projector=self.company_projector,
-                fuse_projected=True
+            preprocessed_stores = preprocessor.preprocess_all(
+                db_engine=db_engine,
+                feature_chunksize=feature_chunksize,
+                feature_limit=feature_limit,
+                show_progress=True
             )
             
-            return {
-                "notice": {
-                    "dense": notice_input["dense"],
-                    "kjt": notice_input["kjt"]
-                },
-                "company": {
-                    "dense": company_input["dense"],
-                    "kjt": company_input["kjt"]
-                },
-                "pair_info": {
-                    "bidntceno": bidntceno,
-                    "bidntceord": bidntceord,
-                    "bizno": bizno
-                }
+            shared_stores = {
+                'preprocessed': preprocessed_stores,
+                'notice': preprocessed_stores['notice'],
+                'company': preprocessed_stores['company']
             }
+            print("Pre-projection 완료!")
+    
+    # 데이터셋 생성 (기존과 동일)
+    train_dataset = UnifiedBidDataset(
+        db_engine=db_engine, schema=schema, limit=limit, is_train=True, 
+        test_split=test_split, shuffle_seed=shuffle_seed, streaming=streaming, 
+        chunk_size=chunk_size, load_all_features=load_all_features,
+        feature_chunksize=feature_chunksize, feature_limit=feature_limit,
+        shared_feature_stores=shared_stores,
+    )
+    
+    test_dataset = UnifiedBidDataset(
+        db_engine=db_engine, schema=schema, limit=limit, is_train=False, 
+        test_split=test_split, shuffle_seed=shuffle_seed, streaming=streaming, 
+        chunk_size=chunk_size, load_all_features=load_all_features,
+        feature_chunksize=feature_chunksize, feature_limit=feature_limit,
+        shared_feature_stores=shared_stores,
+    )
+    
+    # Lightweight collate 함수 사용
+    lightweight_collate_fn = create_lightweight_collate_fn()
+    
+    # DataLoader (lightweight collate 함수 사용)
+    train_loader = DataLoader(
+        dataset=train_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=lightweight_collate_fn,
+        num_workers=0,
+        pin_memory=False  # AsyncBatchPreprocessor에서 pin_memory 처리
+    )
+    
+    test_loader = None
+    if test_dataset is not None:
+        test_loader = DataLoader(
+            dataset=test_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            collate_fn=lightweight_collate_fn,
+            num_workers=0,
+            pin_memory=False
+        )
+    
+    return train_loader, test_loader
 
 
-def unified_bid_collate_fn(batch: List[Dict]) -> Dict[str, Dict[str, torch.Tensor]]:
-    """통합 collate 함수"""
-    batch_size = len(batch)
-    
-    notice_dense_list = []
-    notice_kjt_list = []
-    company_dense_list = []
-    company_kjt_list = []
-    
-    for item in batch:
-        notice_dense_list.append(item["notice"]["dense"])
-        notice_kjt_list.append(item["notice"]["kjt"])
-        company_dense_list.append(item["company"]["dense"])
-        company_kjt_list.append(item["company"]["kjt"])
-    
-    notice_dense_batch = torch.cat(notice_dense_list, dim=0)
-    company_dense_batch = torch.cat(company_dense_list, dim=0)
-    
-    # KJT 배치 결합
+# Helper 함수들
+def _build_batch_kjt_original(categorical_data: torch.Tensor, categorical_keys: List[str]) -> 'KeyedJaggedTensor':
+    """배치용 KJT 생성 (원본 백업)"""
     from torchrec import KeyedJaggedTensor
     
-    notice_values_list = []
-    notice_lengths_list = []
-    for kjt in notice_kjt_list:
-        notice_values_list.append(kjt.values())
-        notice_lengths_list.append(kjt.lengths())
+    batch_size, num_features = categorical_data.shape
+    values_list = []
+    lengths_list = []
     
-    notice_values_batch = torch.cat(notice_values_list)
-    notice_lengths_batch = torch.cat(notice_lengths_list)
+    for i in range(num_features):
+        feature_values = categorical_data[:, i]
+        lengths = torch.ones(batch_size, dtype=torch.long)
+        values_list.append(feature_values)
+        lengths_list.append(lengths)
     
-    notice_kjt_batch = KeyedJaggedTensor.from_lengths_sync(
-        keys=notice_kjt_list[0].keys(),
-        values=notice_values_batch,
-        lengths=notice_lengths_batch
+    all_values = torch.cat(values_list)
+    all_lengths = torch.cat(lengths_list)
+    
+    return KeyedJaggedTensor.from_lengths_sync(
+        keys=categorical_keys,
+        values=all_values,
+        lengths=all_lengths
+    )
+
+
+def _build_batch_kjt_gpu(categorical_data: torch.Tensor, categorical_keys: List[str]) -> 'KeyedJaggedTensor':
+    """GPU 기반 배치용 KJT 생성 (최적화 버전)"""
+    from torchrec import KeyedJaggedTensor
+    
+    # GPU로 이전
+    if categorical_data.device.type != 'cuda':
+        categorical_data = categorical_data.cuda()
+    
+    batch_size, num_features = categorical_data.shape
+    
+    # GPU에서 메모리 할당 및 reshape
+    all_values = categorical_data.flatten()
+    all_lengths = torch.ones(batch_size * num_features, dtype=torch.long, device=categorical_data.device)
+    
+    return KeyedJaggedTensor.from_lengths_sync(
+        keys=categorical_keys,
+        values=all_values,
+        lengths=all_lengths
+    )
+
+
+def _build_batch_kjt(categorical_data: torch.Tensor, categorical_keys: List[str]) -> 'KeyedJaggedTensor':
+    """배치용 KJT 생성 (CPU 버전 - 호환성 유지)"""
+    from torchrec import KeyedJaggedTensor
+    
+    batch_size, num_features = categorical_data.shape
+    
+    # 최적화: 한 번에 메모리 할당 및 reshape
+    all_values = categorical_data.flatten()
+    all_lengths = torch.ones(batch_size * num_features, dtype=torch.long)
+    
+    return KeyedJaggedTensor.from_lengths_sync(
+        keys=categorical_keys,
+        values=all_values,
+        lengths=all_lengths
+    )
+
+
+def _build_single_kjt(categorical_data: torch.Tensor, categorical_keys: List[str]) -> 'KeyedJaggedTensor':
+    """단일 샘플용 KJT 생성"""
+    from torchrec import KeyedJaggedTensor
+    
+    values = categorical_data.flatten()
+    lengths = torch.ones(len(categorical_keys), dtype=torch.long)
+    
+    return KeyedJaggedTensor.from_lengths_sync(
+        keys=categorical_keys,
+        values=values,
+        lengths=lengths
+    )
+
+
+def _combine_kjts(kjt_list: List['KeyedJaggedTensor']) -> 'KeyedJaggedTensor':
+    """KJT 리스트를 배치로 결합"""
+    from torchrec import KeyedJaggedTensor
+    
+    if not kjt_list:
+        raise ValueError("Empty KJT list")
+    
+    keys = kjt_list[0].keys()
+    values_list = [kjt.values() for kjt in kjt_list]
+    lengths_list = [kjt.lengths() for kjt in kjt_list]
+    
+    combined_values = torch.cat(values_list)
+    combined_lengths = torch.cat(lengths_list)
+    
+    return KeyedJaggedTensor.from_lengths_sync(
+        keys=keys,
+        values=combined_values,
+        lengths=combined_lengths
+    )
+
+
+
+def create_unified_bid_dataloaders_gpu(
+    db_engine: Engine,
+    schema: TorchRecSchema,
+    batch_size: int = 32,
+    limit: Optional[int] = None,
+    test_split: float = 0.1,
+    shuffle_seed: int = 42,
+    pin_memory: bool = False,  # GPU 버전에서는 False
+    streaming: bool = False,
+    chunk_size: int = 1000,
+    load_all_features: bool = True,
+    feature_chunksize: int = 5000,
+    feature_limit: Optional[int] = None,
+    use_preprocessor: bool = True
+) -> Tuple[DataLoader, DataLoader]:
+    """GPU 최적화 DataLoader (옵션2: pin_memory=False + GPU 처리)"""
+    
+    # 기존 코드와 동일한 데이터 준비
+    shared_stores = None
+    if load_all_features:
+        if use_preprocessor and streaming:
+            print("FeaturePreprocessor를 사용하여 피처 전처리 중...")
+            from src.torchrec_preprocess.feature_preprocessor import FeaturePreprocessor
+            
+            preprocessor = FeaturePreprocessor(
+                schema=schema,
+                device='cuda:0' if torch.cuda.is_available() else 'cpu',
+                num_proj_dim=128,
+                text_proj_dim=128,
+                batch_size=1024
+            )
+            
+            preprocessed_stores = preprocessor.preprocess_all(
+                db_engine=db_engine,
+                feature_chunksize=feature_chunksize,
+                feature_limit=feature_limit,
+                show_progress=True
+            )
+            
+            shared_stores = {
+                'preprocessed': preprocessed_stores,
+                'notice': preprocessed_stores['notice'],
+                'company': preprocessed_stores['company']
+            }
+            print("Pre-projection 완료!")
+    
+    # 데이터셋 생성
+    train_dataset = UnifiedBidDataset(
+        db_engine=db_engine, schema=schema, limit=limit, is_train=True, 
+        test_split=test_split, shuffle_seed=shuffle_seed, streaming=streaming, 
+        chunk_size=chunk_size, load_all_features=load_all_features,
+        feature_chunksize=feature_chunksize, feature_limit=feature_limit,
+        shared_feature_stores=shared_stores,
     )
     
-    company_values_list = []
-    company_lengths_list = []
-    for kjt in company_kjt_list:
-        company_values_list.append(kjt.values())
-        company_lengths_list.append(kjt.lengths())
-    
-    company_values_batch = torch.cat(company_values_list)
-    company_lengths_batch = torch.cat(company_lengths_list)
-    
-    company_kjt_batch = KeyedJaggedTensor.from_lengths_sync(
-        keys=company_kjt_list[0].keys(),
-        values=company_values_batch,
-        lengths=company_lengths_batch
+    test_dataset = UnifiedBidDataset(
+        db_engine=db_engine, schema=schema, limit=limit, is_train=False, 
+        test_split=test_split, shuffle_seed=shuffle_seed, streaming=streaming, 
+        chunk_size=chunk_size, load_all_features=load_all_features,
+        feature_chunksize=feature_chunksize, feature_limit=feature_limit,
+        shared_feature_stores=shared_stores,
     )
     
-    return {
-        "notice": {
-            "dense": notice_dense_batch,
-            "kjt": notice_kjt_batch
-        },
-        "company": {
-            "dense": company_dense_batch,
-            "kjt": company_kjt_batch
-        }
-    }
+    # GPU collate 함수 사용
+    train_collate_fn = create_collate_fn_gpu(train_dataset)
+    
+    # DataLoader (pin_memory=False 필수)
+    train_loader = DataLoader(
+        dataset=train_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=train_collate_fn,
+        num_workers=0,
+        pin_memory=False  # GPU 버전에서는 False
+    )
+    
+    test_loader = None
+    if test_dataset is not None:
+        test_collate_fn = create_collate_fn_gpu(test_dataset)
+        test_loader = DataLoader(
+            dataset=test_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            collate_fn=test_collate_fn,
+            num_workers=0,
+            pin_memory=False  # GPU 버전에서는 False
+        )
+    
+    return train_loader, test_loader
 
 
 def create_unified_bid_dataloaders(
@@ -537,12 +944,16 @@ def create_unified_bid_dataloaders(
     limit: Optional[int] = None,
     test_split: float = 0.1,
     shuffle_seed: int = 42,
-    num_workers: int = 0,
+    num_workers: int = 4,  # num_workers 추가
+    pin_memory: bool = False,
+    prefetch_factor: int = 2,  # prefetch_factor 추가
+    persistent_workers: bool = False,  # persistent_workers 추가
     streaming: bool = False,
     chunk_size: int = 1000,
     load_all_features: bool = True,
     feature_chunksize: int = 5000,
-    feature_limit: Optional[int] = None
+    feature_limit: Optional[int] = None,
+    use_preprocessor: bool = True  # Pre-projection 사용 여부
     
 ) -> Tuple[DataLoader, DataLoader]:
     """
@@ -554,40 +965,71 @@ def create_unified_bid_dataloaders(
         chunk_size: 스트리밍 시 청크 크기
         feature_chunksize: 피처 로딩 시 청크 크기
         feature_limit: 피처 로딩 시 제한
+        use_preprocessor: True면 FeaturePreprocessor를 사용하여 pre-projection
     """
     
-    # ===== 이 부분을 추가 =====
     shared_stores = None
     if load_all_features:
-        print("공유 피처 데이터 로딩 중...")
-        
-        notice_store = build_feature_store(
-            db_engine, schema.notice, 
-            chunksize=feature_chunksize, 
-            limit=feature_limit, 
-            show_progress=True
-        )
-        
-        company_store = build_feature_store(
-            db_engine, schema.company, 
-            chunksize=feature_chunksize, 
-            limit=feature_limit, 
-            show_progress=True
-        )
-        
-        shared_stores = {
-            'notice': notice_store,
-            'company': company_store
-        }
-        print("공유 피처 스토어 생성 완료")
-    # ========================
+        if use_preprocessor and streaming:  # streaming=True, load_all_features=True에서만 사용
+            print("FeaturePreprocessor를 사용하여 피처 전처리 중...")
+            
+            # FeaturePreprocessor로 전체 피처 전처리
+            preprocessor = FeaturePreprocessor(
+                schema=schema,
+                device='cuda:0' if torch.cuda.is_available() else 'cpu',
+                num_proj_dim=128,
+                text_proj_dim=128,
+                batch_size=1024
+            )
+            
+            preprocessed_stores = preprocessor.preprocess_all(
+                db_engine=db_engine,
+                feature_chunksize=feature_chunksize,
+                feature_limit=feature_limit,
+                show_progress=True
+            )
+            
+            # ID 매핑 생성
+            notice_id_to_idx, company_id_to_idx = preprocessor.build_id_mappings(preprocessed_stores)
+            
+            shared_stores = {
+                'preprocessed': preprocessed_stores,
+                'notice': preprocessed_stores['notice'],
+                'company': preprocessed_stores['company']
+            }
+            print("Pre-projection 완료!")
+        else:
+            # 기존 방식 (raw stores)
+            print("공유 피처 데이터 로딩 중...")
+            
+            notice_store = build_feature_store(
+                db_engine, schema.notice, 
+                chunksize=feature_chunksize, 
+                limit=feature_limit, 
+                show_progress=True
+            )
+            
+            company_store = build_feature_store(
+                db_engine, schema.company, 
+                chunksize=feature_chunksize, 
+                limit=feature_limit, 
+                show_progress=True
+            )
+            
+            shared_stores = {
+                'notice': notice_store,
+                'company': company_store
+            }
+            print("공유 피처 스토어 생성 완료")
+    
+    # 단일 프로세스 모드: DB config 불필요
     
     train_dataset = UnifiedBidDataset(
         db_engine=db_engine, schema=schema, limit=limit,
         test_split=test_split, is_train=True, shuffle_seed=shuffle_seed,
         streaming=streaming, chunk_size=chunk_size, load_all_features=load_all_features,
         feature_chunksize=feature_chunksize, feature_limit=feature_limit,
-        shared_feature_stores=shared_stores  
+        shared_feature_stores=shared_stores,
     )
     
     test_dataset = None
@@ -597,19 +1039,38 @@ def create_unified_bid_dataloaders(
             test_split=test_split, is_train=False, shuffle_seed=shuffle_seed,
             streaming=streaming, chunk_size=chunk_size, load_all_features=load_all_features,
             feature_chunksize=feature_chunksize, feature_limit=feature_limit,
-            shared_feature_stores=shared_stores  
-        )
+            shared_feature_stores=shared_stores,
+            )
     
+    # 데이터셋에 맞는 collate 함수 생성
+    train_collate_fn = create_collate_fn(train_dataset)
+    
+    # DataLoader 파라미터 (멀티프로세스 지원)
     train_loader = DataLoader(
-        train_dataset, batch_size=batch_size, shuffle=False,
-        collate_fn=unified_bid_collate_fn, num_workers=num_workers, pin_memory=False
+        dataset=train_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=train_collate_fn,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        prefetch_factor=prefetch_factor if num_workers > 0 else None,
+        persistent_workers=persistent_workers if num_workers > 0 else False
     )       
     
     test_loader = None
     if test_dataset is not None:
+        test_collate_fn = create_collate_fn(test_dataset)
+        
+        # Test DataLoader (멀티프로세스 지원)
         test_loader = DataLoader(
-            test_dataset, batch_size=batch_size, shuffle=False,
-            collate_fn=unified_bid_collate_fn, num_workers=num_workers, pin_memory=False
+            dataset=test_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            collate_fn=test_collate_fn,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            prefetch_factor=prefetch_factor if num_workers > 0 else None,
+            persistent_workers=persistent_workers if num_workers > 0 else False
         )
     
     return train_loader, test_loader

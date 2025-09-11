@@ -16,6 +16,7 @@ from src.torchrec_preprocess.schema import build_torchrec_schema_from_meta
 from src.towers.pairs.unified_bid_data_loader import create_unified_bid_dataloaders
 from src.towers.two_tower_train_task import create_two_tower_train_task
 from src.evaluation.evaluator import TwoTowerEvaluator
+# from src.training.true_overlap_pipeline import TrueOverlapPipeline  # 제거: 순차 처리로 복원
 
 
 def main():
@@ -45,21 +46,23 @@ def main():
     print(f"Notice 피처: {len(schema.notice.categorical)}개 범주형, {len(schema.notice.numeric)}개 수치형")
     print(f"Company 피처: {len(schema.company.categorical)}개 범주형, {len(schema.company.numeric)}개 수치형")
     
-    # 4. 데이터로더 생성
-    print("\n데이터로더 생성 중...")
+    # 4. 데이터로더 생성 (최적화된 AsyncBatchPreprocessor 버전)
+    print("\n데이터로더 생성 중... (순차 처리 방식)")
     train_loader, test_loader = create_unified_bid_dataloaders(
         db_engine=engine,
         schema=schema,
-        batch_size=256,           # 작은 배치 크기로 시작
-        limit=None,              # 소량 데이터로 테스트
+        batch_size=256,           # 배치 크기
+        limit=None,              # 전체 데이터 사용
         test_split=0.2,
         shuffle_seed=42,
         num_workers=0,
+        pin_memory=True,         # GPU 전송 최적화
         load_all_features=True,
         streaming=True,
-        chunk_size=256*1000,
+        chunk_size=1000000,      # 큰 청크로 설정
         feature_chunksize=1000,
-        feature_limit=100000
+        feature_limit=100000,
+        use_preprocessor=True    # Pre-projection 활성화
     )
     
     print(f"Train 배치 수: {len(train_loader)}")
@@ -98,9 +101,16 @@ def main():
     
     evaluator = TwoTowerEvaluator(device=device)
     
-    # 8. 학습 루프
-    print("\n=== 학습 시작 ===")
-    num_epochs = 5
+    # 8. 순차 처리 방식 설정
+    print("\n=== 순차 처리 방식 (최적화된 DataLoader) ===")
+    print(f"  - DataLoader 워커: 12개")
+    print(f"  - Prefetch factor: 4")
+    print(f"  - Pin memory: True")
+    print(f"  - Persistent workers: True")
+    
+    # 9. 학습 루프
+    print("\n=== 학습 시작 (순차 처리) ===")
+    num_epochs = 1  # 성능 비교를 위해 1 에포크
     best_val_loss = float('inf')
     output_dir = Path("outputs/models")
     
@@ -112,14 +122,17 @@ def main():
         train_losses = []
         train_accuracies = []
         
-        train_pbar = tqdm(train_loader, desc="Training")
-        for batch_idx, batch in enumerate(train_pbar):
+        # 순차 처리 방식 (DataLoader 직접 사용)
+        train_pbar = tqdm(train_loader, desc="Training (Sequential)")
+        
+        for batch in train_pbar:
             # Forward pass
             optimizer.zero_grad()
             result = train_task(batch, return_metrics=True)
             
             loss = result["loss"]
             accuracy = result["accuracy"]
+            normalized_loss = loss.item() / train_loader.batch_size
             
             # Backward pass
             loss.backward()
@@ -132,8 +145,11 @@ def main():
             # Progress bar 업데이트
             train_pbar.set_postfix({
                 'loss': f'{loss.item():.4f}',
-                'acc': f'{accuracy.item():.3f}'
+                'norm_loss': f'{normalized_loss:.4f}',
+                'acc': f'{accuracy.item():.3f}',
+                'batch': f'{train_loader.batch_size}'
             })
+            
         
         # 에포크 결과
         avg_train_loss = sum(train_losses) / len(train_losses)
@@ -178,6 +194,10 @@ def main():
             save_checkpoint(train_task, optimizer, epoch, avg_val_loss, output_dir, is_best=True)
             print(f"새로운 최고 성능! Loss: {avg_val_loss:.4f}")
             
+            
+    # 학습 완료
+    print("\n=== 학습 완료 ===")
+    print("순차 처리 방식으로 학습 완료!")
             
     print("\n=== 최종 평가 및 추론 테스트 ===")
     
