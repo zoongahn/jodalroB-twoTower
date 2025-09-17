@@ -16,7 +16,6 @@ from src.torchrec_preprocess.schema import build_torchrec_schema_from_meta
 from src.towers.pairs.unified_bid_data_loader import create_unified_bid_dataloaders
 from src.towers.two_tower_train_task import create_two_tower_train_task
 from src.evaluation.evaluator import TwoTowerEvaluator
-# from src.training.true_overlap_pipeline import TrueOverlapPipeline  # 제거: 순차 처리로 복원
 
 
 def main():
@@ -46,23 +45,23 @@ def main():
     print(f"Notice 피처: {len(schema.notice.categorical)}개 범주형, {len(schema.notice.numeric)}개 수치형")
     print(f"Company 피처: {len(schema.company.categorical)}개 범주형, {len(schema.company.numeric)}개 수치형")
     
-    # 4. 데이터로더 생성 (최적화된 AsyncBatchPreprocessor 버전)
-    print("\n데이터로더 생성 중... (순차 처리 방식)")
+    # 4. 데이터로더 생성 (Test Mode - 선택적 피처 로딩)
+    print("\n데이터로더 생성 중... (Test Mode - 빠른 개발용)")
     train_loader, test_loader = create_unified_bid_dataloaders(
         db_engine=engine,
         schema=schema,
         batch_size=256,           # 배치 크기
-        limit=None,              # 전체 데이터 사용
         test_split=0.2,
         shuffle_seed=42,
         num_workers=0,
         pin_memory=True,         # GPU 전송 최적화
         load_all_features=True,
-        streaming=True,
+        streaming=False,
         chunk_size=1000000,      # 큰 청크로 설정
         feature_chunksize=1000,
-        feature_limit=100000,
-        use_preprocessor=True    # Pre-projection 활성화
+        use_preprocessor=True,   # Pre-projection 활성화
+        test_mode=True,         # 일단 기본 모드로 복원
+        pair_limit=1000000,        # 기본 모드에서는 사용 안함
     )
     
     print(f"Train 배치 수: {len(train_loader)}")
@@ -91,13 +90,25 @@ def main():
         device=device
     )
     
-    # 6. 옵티마이저 설정
+    # 6. 옵티마이저 및 스케줄러 설정
     optimizer = optim.Adam(train_task.parameters(), lr=1e-3, weight_decay=1e-5)
+
+    # Learning Rate Warmup 스케줄러 (5% warmup)
+    from torch.optim.lr_scheduler import LambdaLR
+    warmup_steps = max(1, int(len(train_loader) * 0.05))
+
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return step / warmup_steps
+        return 1.0
+
+    scheduler = LambdaLR(optimizer, lr_lambda, last_epoch=-1)
     
     # 7. 모델 정보 출력
     total_params = sum(p.numel() for p in train_task.parameters())
     trainable_params = sum(p.numel() for p in train_task.parameters() if p.requires_grad)
     print(f"\n모델 파라미터: {total_params:,}개 (학습 가능: {trainable_params:,}개)")
+    print(f"Learning Rate Warmup: {warmup_steps} steps ({warmup_steps/len(train_loader)*100:.1f}% of epoch)")
     
     evaluator = TwoTowerEvaluator(device=device)
     
@@ -137,6 +148,9 @@ def main():
             # Backward pass
             loss.backward()
             optimizer.step()
+
+            # Scheduler step (optimizer.step() 이후에 호출)
+            scheduler.step()
             
             # 메트릭 저장
             train_losses.append(loss.item())

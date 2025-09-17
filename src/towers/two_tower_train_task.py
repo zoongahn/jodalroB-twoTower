@@ -78,7 +78,12 @@ class TwoTowerTrainTask(nn.Module):
             notice_embeddings, company_embeddings
         )  # [B, B]
         
-        # 4) 손실 계산
+        # 4) Positive pair 정합성 검증 (최초 1회만)
+        if not hasattr(self, '_pair_check_done'):
+            self._verify_positive_pair_alignment(similarity_matrix)
+            self._pair_check_done = True
+
+        # 5) 손실 계산
         loss = self._compute_loss(similarity_matrix, batch_size)
         
         if return_metrics:
@@ -112,13 +117,21 @@ class TwoTowerTrainTask(nn.Module):
         if self.loss_type == "cross_entropy":
             # 대각선이 positive pair (정답 레이블)
             labels = torch.arange(batch_size, device=similarity_matrix.device)
-            
-            # Cross entropy loss (각 공고가 자신과 매칭되는 업체를 선택)
-            loss = F.cross_entropy(
-                similarity_matrix, 
-                labels, 
+
+            # 양방향 Cross Entropy Loss (더 강한 학습 신호)
+            loss_notice_to_company = F.cross_entropy(
+                similarity_matrix,
+                labels,
                 label_smoothing=self.label_smoothing
             )
+            loss_company_to_notice = F.cross_entropy(
+                similarity_matrix.t(),
+                labels,
+                label_smoothing=self.label_smoothing
+            )
+
+            # 평균으로 결합
+            loss = 0.5 * (loss_notice_to_company + loss_company_to_notice)
             
         elif self.loss_type == "cosine_embedding":
             # Cosine embedding loss 구현
@@ -234,3 +247,47 @@ def create_two_tower_train_task(
     )
     
     return train_task
+
+
+# 추가 메서드들을 TwoTowerTrainTask 클래스에 동적으로 추가
+def _verify_positive_pair_alignment(self, similarity_matrix: torch.Tensor):
+    """Positive pair 정합성 검증 - 대각선이 진짜 정답인지 확인"""
+    B = similarity_matrix.size(0)
+
+    # 각 notice가 가장 유사한 company 선택 (row-wise)
+    row_top1 = similarity_matrix.argmax(dim=1)
+    # 각 company가 가장 유사한 notice 선택 (col-wise)
+    col_top1 = similarity_matrix.argmax(dim=0)
+
+    # 대각선 인덱스 (정답이어야 할 위치)
+    diag_idx = torch.arange(B, device=similarity_matrix.device)
+
+    # 정확도 계산
+    row_hit = (row_top1 == diag_idx).float().mean().item()  # notice → company
+    col_hit = (col_top1 == diag_idx).float().mean().item()  # company → notice
+
+    print(f"🔍 [Positive Pair Alignment Check]")
+    print(f"   📊 Notice→Company Top-1 정확도: {row_hit:.3f}")
+    print(f"   📊 Company→Notice Top-1 정확도: {col_hit:.3f}")
+
+    # 대각선 vs 최대값 분석
+    diag_values = similarity_matrix.diag()
+    max_values = similarity_matrix.max(dim=1)[0]
+    diag_is_max = (diag_values == max_values).float().mean().item()
+
+    print(f"   🎯 대각선이 row-max인 비율: {diag_is_max:.3f}")
+
+    # 경고 판정
+    if row_hit < 0.05 and col_hit < 0.05:
+        print("   🚨 CRITICAL: Positive pair 정합성 실패!")
+        print("   → DataLoader에서 notice/company 순서가 어긋남")
+        print("   → 동일한 샘플러/인덱스로 페어를 구성하세요")
+    elif row_hit < 0.3 or col_hit < 0.3:
+        print("   ⚠️  WARNING: Positive pair 정합성 부족")
+        print("   → 배치 내 positive 비율 확인 필요")
+    else:
+        print("   ✅ Positive pair 정합성 양호")
+    print()
+
+# 메서드를 클래스에 바인딩
+TwoTowerTrainTask._verify_positive_pair_alignment = _verify_positive_pair_alignment

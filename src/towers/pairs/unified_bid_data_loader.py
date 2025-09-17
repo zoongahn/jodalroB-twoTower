@@ -123,15 +123,29 @@ class UnifiedBidDataset(Dataset):
         
         print(f"UnifiedBidDataset 초기화... (train={is_train}, streaming={streaming}, load_all_features={load_all_features})")
         
+        # pairs 데이터 초기화
+        self.pairs = None
+        self.total_count = 0
+
         if streaming:
             # 스트리밍 모드: 개수와 범위만 계산
             self.total_count, self.start_id, self.end_id = self._get_data_info_streaming(limit, test_split)
             self.chunk_cache = {}  # {chunk_id: DataFrame}
             self.pairs = None  # 스트리밍에서는 pairs를 미리 로드하지 않음
         else:
-            # 기존 모드: 전체 pairs 로드
-            self.pairs = self._load_positive_pairs_static(limit, test_split, shuffle, shuffle_seed)
-            self.total_count = len(self.pairs)
+            # Test mode: shared_feature_stores에 pairs가 있는지 먼저 확인
+            if shared_feature_stores is not None and 'pairs_data' in shared_feature_stores:
+                pairs_data = shared_feature_stores['pairs_data']
+                if is_train:
+                    self.pairs = pairs_data['train_pairs']
+                else:
+                    self.pairs = pairs_data['test_pairs']
+                self.total_count = len(self.pairs) if self.pairs is not None else 0
+                print(f"Test mode pairs 사용: {self.total_count} pairs")
+            else:
+                # 기존 모드: 전체 pairs 로드
+                self.pairs = self._load_positive_pairs_static(limit, test_split, shuffle, shuffle_seed)
+                self.total_count = len(self.pairs)
         
         # 피처 로딩
         if load_all_features:
@@ -145,11 +159,15 @@ class UnifiedBidDataset(Dataset):
                     self.company_store = self.preprocessed_stores['company']
                     self._build_id_mappings(self.notice_store, self.company_store)
                 else:
-                    # 기존 방식 (raw stores)
+                    # Test mode: raw stores + projection 필요
                     self.notice_store = shared_feature_stores['notice']
                     self.company_store = shared_feature_stores['company']
                     self._build_id_mappings(self.notice_store, self.company_store)
                     self._setup_projectors()
+
+                    # Test mode: raw 데이터를 projection하여 dense_projected 생성
+                    print("  - Test mode: raw 데이터 projection 중...")
+                    self._project_raw_features()
             else:
                 print("개별 피처 스토어 로딩")
                 self._load_all_features()
@@ -441,30 +459,43 @@ class UnifiedBidDataset(Dataset):
         return self.total_count
     
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        """단순화된 아이템 반환 - load_all_features=True, streaming=True 전용"""
+        """아이템 반환 - 스트리밍 모드와 정적 모드 구분 처리"""
         if idx >= self.total_count:
             raise IndexError(f"Index {idx} out of range (total: {self.total_count})")
+
+        if self.streaming:
+            # 스트리밍 모드: 청크에서 pair 데이터 조회
+            chunk_id = self._get_chunk_id(idx)
+            if chunk_id not in self.chunk_cache:
+                chunk_arrays = self._load_chunk(chunk_id)
+                self.chunk_cache[chunk_id] = chunk_arrays
+
+            # 청크 캐시에서 빠른 조회
+            local_idx = idx % self.chunk_size
+            chunk_arrays = self.chunk_cache[chunk_id]
+
+            bidntceno = chunk_arrays['bidntceno'][local_idx]
+            bidntceord = chunk_arrays['bidntceord'][local_idx]
+            bizno = str(chunk_arrays['bizno'][local_idx])
+        else:
+            # 정적 모드: pairs DataFrame에서 직접 조회
+            pair_row = self.pairs.iloc[idx]
+            bidntceno = pair_row['bidntceno']
+            bidntceord = pair_row['bidntceord']
+            bizno = str(pair_row['bizno'])
         
-        # 청크에서 pair 데이터 조회
-        chunk_id = self._get_chunk_id(idx)
-        if chunk_id not in self.chunk_cache:
-            chunk_arrays = self._load_chunk(chunk_id)
-            self.chunk_cache[chunk_id] = chunk_arrays
-            # print(f"청크 {chunk_id} 로딩 완료")  # 로그 제거 (워커별 중복 출력 방지)
-            
-        # 청크 캐시에서 빠른 조회
-        local_idx = idx % self.chunk_size
-        chunk_arrays = self.chunk_cache[chunk_id]
-        bidntceno = chunk_arrays['bidntceno'][local_idx]
-        bidntceord = chunk_arrays['bidntceord'][local_idx]
-        bizno = str(chunk_arrays['bizno'][local_idx])
-        
-        # 인덱스 조회
+        # 인덱스 조회 (Test Mode에서는 100% 매칭 보장)
         notice_key = (bidntceno, bidntceord)
         company_key = bizno
-        
-        notice_idx = self.notice_id_to_idx.get(notice_key, 0)
-        company_idx = self.company_id_to_idx.get(company_key, 0)
+
+        notice_idx = self.notice_id_to_idx.get(notice_key)
+        company_idx = self.company_id_to_idx.get(company_key)
+
+        # Test Mode에서는 누락 ID가 있으면 명확히 오류 발생
+        if notice_idx is None:
+            raise KeyError(f"Notice ID not found in features: {notice_key}")
+        if company_idx is None:
+            raise KeyError(f"Company ID not found in features: {company_key}")
         
         return {
             "notice_idx": notice_idx,
@@ -953,12 +984,14 @@ def create_unified_bid_dataloaders(
     load_all_features: bool = True,
     feature_chunksize: int = 5000,
     feature_limit: Optional[int] = None,
-    use_preprocessor: bool = True  # Pre-projection 사용 여부
-    
+    use_preprocessor: bool = True,  # Pre-projection 사용 여부
+    test_mode: bool = False,        # 테스트 모드 플래그
+    pair_limit: Optional[int] = None,  # 테스트 시 pair 제한
+
 ) -> Tuple[DataLoader, DataLoader]:
     """
     통합 DataLoader 생성
-    
+
     Args:
         streaming: True면 pair 스트리밍
         load_all_features: False면 선택적 피처 로딩
@@ -966,8 +999,27 @@ def create_unified_bid_dataloaders(
         feature_chunksize: 피처 로딩 시 청크 크기
         feature_limit: 피처 로딩 시 제한
         use_preprocessor: True면 FeaturePreprocessor를 사용하여 pre-projection
+        test_mode: True면 빠른 테스트를 위한 선택적 로딩 모드
+        pair_limit: test_mode=True일 때 사용할 pair 수 제한
     """
-    
+
+    # Test Mode: 선택적 피처 로딩
+    if test_mode:
+        print(f"🧪 Test Mode 활성화: pair_limit={pair_limit}")
+        return _create_test_mode_dataloaders(
+            db_engine=db_engine,
+            schema=schema,
+            batch_size=batch_size,
+            pair_limit=pair_limit,
+            test_split=test_split,
+            shuffle_seed=shuffle_seed,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            prefetch_factor=prefetch_factor,
+            persistent_workers=persistent_workers,
+            use_preprocessor=use_preprocessor
+        )
+
     shared_stores = None
     if load_all_features:
         if use_preprocessor and streaming:  # streaming=True, load_all_features=True에서만 사용
@@ -1102,8 +1154,298 @@ if __name__ == "__main__":
     
     print(f"Train batches: {len(train_loader)}")
     print(f"Test batches: {len(test_loader) if test_loader else 'None'}")
-    
+
     for batch_idx, batch in enumerate(train_loader):
         print(f"Batch {batch_idx}: Notice {batch['notice']['dense'].shape}, Company {batch['company']['dense'].shape}")
         if batch_idx >= 2:
             break
+
+
+def _create_test_mode_dataloaders(
+    db_engine: Engine,
+    schema: TorchRecSchema,
+    batch_size: int,
+    pair_limit: Optional[int],
+    test_split: float,
+    shuffle_seed: int,
+    num_workers: int,
+    pin_memory: bool,
+    prefetch_factor: int,
+    persistent_workers: bool,
+    use_preprocessor: bool
+) -> Tuple[DataLoader, DataLoader]:
+    """
+    Test Mode용 DataLoader 생성 - 실제 pair에 해당하는 피처만 선택적 로딩
+
+    핵심: pair → ID 추출 → 해당 ID 피처만 로딩 → 100% 매칭 보장
+    """
+
+    # 1. 제한된 pair 로딩
+    print("📊 제한된 pair 데이터 로딩 중...")
+    pair_query = f"""
+    SELECT bidntceno, bidntceord, bizno, id
+    FROM bid_two_tower
+    """
+    if pair_limit:
+        pair_query += f" LIMIT {pair_limit}"
+
+    pairs_df = pd.read_sql(pair_query, db_engine)
+    print(f"   로딩된 pair 수: {len(pairs_df):,}")
+
+    # 2. 실제 pair ID 추출
+    notice_ids = set(zip(pairs_df['bidntceno'], pairs_df['bidntceord']))
+    company_ids = set(pairs_df['bizno'].astype(str))
+
+    print(f"   Notice ID 수: {len(notice_ids):,}")
+    print(f"   Company ID 수: {len(company_ids):,}")
+
+    # 3. 선택적 피처 로딩 (100% 매칭 보장)
+    print("🎯 선택적 피처 로딩 중...")
+    print(f"   Notice ID {len(notice_ids):,}개만 DB에서 직접 로딩...")
+    print(f"   Company ID {len(company_ids):,}개만 DB에서 직접 로딩...")
+
+    # SQL WHERE 조건절로 필요한 ID만 직접 로딩
+    notice_store = _load_features_for_test_mode(
+        db_engine, schema.notice, notice_ids, "notice", show_progress=True
+    )
+    company_store = _load_features_for_test_mode(
+        db_engine, schema.company, company_ids, "company", show_progress=True
+    )
+
+    # 4. ID 매핑 생성 (선택된 ID만)
+    notice_id_to_idx = {id_tuple: idx for idx, id_tuple in enumerate(notice_ids)}
+    company_id_to_idx = {str(id_val): idx for idx, id_val in enumerate(company_ids)}
+
+    print(f"✅ 매칭 보장: Notice {len(notice_id_to_idx)}, Company {len(company_id_to_idx)}")
+
+    # 5. Train/Test 분할
+    train_pairs, test_pairs = None, None
+    if test_split > 0:
+        from sklearn.model_selection import train_test_split
+        train_pairs, test_pairs = train_test_split(
+            pairs_df, test_size=test_split, random_state=shuffle_seed
+        )
+    else:
+        train_pairs = pairs_df
+
+    # 6. 공유 스토어 생성 (pairs 포함)
+    shared_stores = {
+        'notice': notice_store,
+        'company': company_store,
+        'pairs_data': {
+            'train_pairs': train_pairs,
+            'test_pairs': test_pairs,
+            'notice_id_to_idx': notice_id_to_idx,
+            'company_id_to_idx': company_id_to_idx
+        }
+    }
+
+    # 7. Dataset 생성 (일단 전체 데이터로 기본 생성)
+    # Test Mode에서는 ID 매핑만 덮어씌우기
+    train_dataset = UnifiedBidDataset(
+        db_engine=db_engine,
+        schema=schema,
+        limit=pair_limit,  # pair_limit 사용
+        test_split=test_split,
+        is_train=True,
+        streaming=False,  # Test mode는 정적 로딩
+        chunk_size=1000,
+        load_all_features=True,
+        shared_feature_stores=shared_stores,
+    )
+
+    test_dataset = None
+    if test_split > 0:
+        test_dataset = UnifiedBidDataset(
+            db_engine=db_engine,
+            schema=schema,
+            limit=pair_limit,
+            test_split=test_split,
+            is_train=False,
+            streaming=False,
+            chunk_size=1000,
+            load_all_features=True,
+            shared_feature_stores=shared_stores,
+        )
+
+    # 8. Collate 함수 선택
+    train_collate_fn = create_collate_fn(train_dataset)
+
+    # 9. DataLoader 생성
+    train_loader = DataLoader(
+        dataset=train_dataset,
+        batch_size=batch_size,
+        shuffle=True,  # Test mode에서도 셔플 허용
+        collate_fn=train_collate_fn,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        prefetch_factor=prefetch_factor if num_workers > 0 else None,
+        persistent_workers=persistent_workers if num_workers > 0 else False
+    )
+
+    test_loader = None
+    if test_dataset is not None:
+        test_collate_fn = create_collate_fn(test_dataset)
+        test_loader = DataLoader(
+            dataset=test_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            collate_fn=test_collate_fn,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            prefetch_factor=prefetch_factor if num_workers > 0 else None,
+            persistent_workers=persistent_workers if num_workers > 0 else False
+        )
+
+    print(f"🎯 Test Mode DataLoader 완성!")
+    print(f"   Train 배치: {len(train_loader)}")
+    print(f"   Test 배치: {len(test_loader) if test_loader else 0}")
+
+    return train_loader, test_loader
+
+
+def _load_features_for_test_mode(
+    db_engine: Engine,
+    schema_part,  # schema.notice 또는 schema.company
+    target_ids: set,
+    table_type: str,  # "notice" 또는 "company"
+    show_progress: bool = False
+) -> Dict:
+    """Test Mode용 선택적 피처 로딩 (SQL WHERE 조건절 사용)"""
+
+    id_list = list(target_ids)
+    print(f"Loading {table_type}: {len(id_list):,}개")
+
+    if table_type == "notice":
+        # Notice ID 조건 생성 (tuples of bidntceno, bidntceord)
+        conditions = []
+        for bidntceno, bidntceord in id_list:
+            conditions.append(f"(bidntceno='{bidntceno}' AND bidntceord::integer={int(bidntceord)})")
+        where_condition = " OR ".join(conditions)
+
+    elif table_type == "company":
+        # Company ID 조건 생성 (bizno IN clause)
+        quoted_ids = [f"'{cid}'" for cid in id_list]
+        where_condition = "bizno IN (" + ",".join(quoted_ids) + ")"
+
+    else:
+        raise ValueError(f"Unknown table_type: {table_type}")
+
+    # SQL WHERE 조건으로 피처 로딩
+    store = build_feature_store_with_condition(
+        db_engine, schema_part, where_condition=where_condition, show_progress=show_progress
+    )
+
+    # 디버깅: store 내용 확인
+    available_keys = list(store.keys())
+    print(f"✅ {table_type.capitalize()} 피처 로딩 완료")
+    print(f"   Available keys: {available_keys}")
+    for key in available_keys:
+        if hasattr(store[key], '__len__'):
+            print(f"   {key}: {len(store[key])} items")
+
+    return store
+
+
+def _load_features_for_test_mode_with_preprocessor(
+    db_engine: Engine,
+    schema: TorchRecSchema,
+    notice_ids: set,
+    company_ids: set
+) -> Tuple[Dict, Dict]:
+    """Test Mode용 Preprocessor 피처 로딩 (선택된 ID만)"""
+
+    from src.torchrec_preprocess.feature_preprocessor import FeaturePreprocessor
+
+    # ID 필터 기반 Preprocessor 실행
+    preprocessor = FeaturePreprocessor(
+        schema=schema,
+        device='cuda:0' if torch.cuda.is_available() else 'cpu',
+        num_proj_dim=128,
+        text_proj_dim=128,
+        batch_size=1024
+    )
+
+    # 선택적 전처리 (해당 ID만)
+    preprocessed_stores = preprocessor.preprocess_selective(
+        db_engine=db_engine,
+        notice_id_filter=notice_ids,
+        company_id_filter=company_ids,
+        show_progress=True
+    )
+
+    return preprocessed_stores['notice'], preprocessed_stores['company']
+
+
+def _project_raw_features(self):
+    """Test mode: raw 피처 데이터를 projection하여 dense_projected 생성"""
+    import torch
+    import numpy as np
+
+    # 디버깅: text 데이터 구조 확인
+    print(f"    Notice text type: {type(self.notice_store['text'])}")
+    print(f"    Company text type: {type(self.company_store['text'])}")
+
+    if isinstance(self.notice_store['text'], dict):
+        print(f"    Notice text keys: {list(self.notice_store['text'].keys())}")
+    if isinstance(self.company_store['text'], dict):
+        print(f"    Company text keys: {list(self.company_store['text'].keys())}")
+
+    # Notice projection
+    notice_numeric = torch.from_numpy(self.notice_store['numeric']).float()
+
+    # text 데이터 처리 - FeatureProjector는 dict를 기대함
+    if isinstance(self.notice_store['text'], dict):
+        notice_text_dict = {
+            key: torch.from_numpy(val).float()
+            for key, val in self.notice_store['text'].items()
+        }
+    else:
+        # text가 없는 경우 빈 dict
+        notice_text_dict = {}
+
+    with torch.no_grad():
+        notice_dense_proj, notice_text_proj = self.notice_projector(notice_numeric, notice_text_dict)
+        # 최종 projection 결합 (dense + text)
+        if notice_text_proj:
+            # text projection이 있으면 concatenate
+            text_values = list(notice_text_proj.values())
+            combined_text = torch.cat(text_values, dim=1) if text_values else torch.zeros(notice_dense_proj.size(0), 0)
+            notice_projected = torch.cat([notice_dense_proj, combined_text], dim=1)
+        else:
+            notice_projected = notice_dense_proj
+
+    # Company projection
+    company_numeric = torch.from_numpy(self.company_store['numeric']).float()
+
+    # Company text 데이터 처리 - FeatureProjector는 dict를 기대함
+    if isinstance(self.company_store['text'], dict):
+        company_text_dict = {
+            key: torch.from_numpy(val).float()
+            for key, val in self.company_store['text'].items()
+        }
+    else:
+        # text가 없는 경우 빈 dict (Company는 None인 경우가 많음)
+        company_text_dict = {}
+
+    with torch.no_grad():
+        company_dense_proj, company_text_proj = self.company_projector(company_numeric, company_text_dict)
+        # 최종 projection 결합 (dense + text)
+        if company_text_proj:
+            # text projection이 있으면 concatenate
+            text_values = list(company_text_proj.values())
+            combined_text = torch.cat(text_values, dim=1) if text_values else torch.zeros(company_dense_proj.size(0), 0)
+            company_projected = torch.cat([company_dense_proj, combined_text], dim=1)
+        else:
+            company_projected = company_dense_proj
+
+    # dense_projected 키 추가
+    self.notice_store['dense_projected'] = notice_projected.numpy()
+    self.company_store['dense_projected'] = company_projected.numpy()
+
+    print(f"    Notice projection: {notice_projected.shape}")
+    print(f"    Company projection: {company_projected.shape}")
+
+
+# UnifiedBidDataset 클래스에 메서드 바인딩
+UnifiedBidDataset._project_raw_features = _project_raw_features

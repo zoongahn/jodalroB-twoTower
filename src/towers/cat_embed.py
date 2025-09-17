@@ -34,9 +34,7 @@ class CategoricalEmbedder(nn.Module):
         # 메타데이터에서 vocab_size 정보 추출
         self.vocab_sizes = self._extract_vocab_sizes(metadata_path, table_name, keys)
         
-        print(f"[CategoricalEmbedder] Initializing with {len(keys)} features:")
-        for key in keys:
-            print(f"  {key}: vocab_size={self.vocab_sizes[key]}")
+        print(f"[CategoricalEmbedder] Initializing with {len(keys)} features")
         
         # 기본 PyTorch Embedding 테이블들 생성
         self.embeddings = nn.ModuleDict()
