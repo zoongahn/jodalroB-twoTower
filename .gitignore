@@ -211,5 +211,6 @@ venv/
 
 output/
 outputs/
+models/
 parquet/
 __pycache__/
