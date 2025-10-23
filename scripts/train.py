@@ -183,7 +183,34 @@ def main():
         "metadata_path": "meta/metadata.csv"
     }
 
-    print(f"🔧 설정된 하이퍼파라미터:")
+    # CRITICAL: Resume 체크를 가장 먼저 수행 (config 덮어쓰기)
+    if config.get("resume"):
+        checkpoint_path = Path(config["resume"])
+        if checkpoint_path.exists():
+            print(f"\n🔄 이어학습 모드: {checkpoint_path}")
+            output_dir_resume = checkpoint_path.parent
+            config_json_path = output_dir_resume / "config.json"
+
+            if config_json_path.exists():
+                print(f"📋 기존 학습 설정 로드: {config_json_path}")
+                import json
+                with open(config_json_path, "r", encoding="utf-8") as f:
+                    saved_config = json.load(f)
+
+                # 기존 config로 덮어쓰기 (num_epochs, resume 제외)
+                for key in saved_config:
+                    if key in ["resume", "output_dir", "timestamp", "total_params", "trainable_params", "num_epochs"]:
+                        continue
+                    if key in config:
+                        config[key] = saved_config[key]
+
+                print(f"✅ 기존 하이퍼파라미터 복원 완료")
+            else:
+                print(f"⚠️ config.json을 찾을 수 없습니다. 명령줄 인자 사용")
+        else:
+            print(f"⚠️ 체크포인트를 찾을 수 없습니다: {checkpoint_path}")
+
+    print(f"\n🔧 설정된 하이퍼파라미터:")
     pair_limit_str = f"{config['pair_limit']:,}" if config['pair_limit'] is not None else "전체"
     print(f"   - Test Mode: {config['test_mode']} (Pair Limit: {pair_limit_str})")
     print(f"   - Batch Size: {config['batch_size']}")
@@ -326,15 +353,14 @@ def main():
     best_val_loss = float('inf')
     start_epoch = 0
 
-    # Resume 체크
+    # Resume: 체크포인트 로드
     if config.get("resume"):
         checkpoint_path = Path(config["resume"])
         if checkpoint_path.exists():
-            print(f"\n🔄 이어학습 모드: {checkpoint_path}")
             start_epoch, best_val_loss = load_checkpoint(train_task, optimizer, checkpoint_path)
-            # Output 디렉토리는 체크포인트의 부모 디렉토리 사용
             output_dir = checkpoint_path.parent
-            print(f"기존 모델 저장 경로 사용: {output_dir}")
+            print(f"✅ 모델 로드 완료. Epoch {start_epoch}부터 재개")
+            print(f"   기존 모델 저장 경로: {output_dir}")
         else:
             print(f"⚠️ 체크포인트를 찾을 수 없습니다: {checkpoint_path}")
             print("새로운 학습을 시작합니다.")
