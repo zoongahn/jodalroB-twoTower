@@ -12,11 +12,21 @@ class QueryHelper:
     def __init__(self, db_connector: DatabaseConnector):
         self.db_connector = db_connector
 
-        # 테이블명 정의 (변경 시 여기서만 수정)
+        # .env에서 스키마 및 테이블 설정 로드
+        import os
+        from dotenv import load_dotenv
+        load_dotenv()
+
+        db_schema = os.getenv("DB_SCHEMA", "public")
+        notice_table = os.getenv("NOTICE_TABLE", "notice")
+        company_table = os.getenv("COMPANY_TABLE", "company")
+        bid_table = os.getenv("BID_TWO_TOWER_TABLE", "bid_two_tower")
+
+        # 테이블명 정의 (스키마.테이블 형식)
         self.table_names = {
-            'notice': 'notice',     # 공고 테이블명
-            'bid': 'bid_two_tower',           # 투찰 테이블명
-            'company': 'company'    # 업체 테이블명
+            'notice': f'{db_schema}.{notice_table}',     # 공고 테이블명
+            'bid': f'{db_schema}.{bid_table}',           # 투찰 테이블명
+            'company': f'{db_schema}.{company_table}'    # 업체 테이블명
         }
 
         # 테이블별 PK 정의 (복합키 지원)
@@ -359,21 +369,27 @@ class QueryHelper:
         exclude_text_cols = set(exclude_text_cols or [])
         # 너의 기존 "use 컬럼" 리스트를 가져오는 로직이 있다면 그걸 재사용하세요.
         # 없으면 전체 컬럼에서 제외만 반영:
+        import os
+        db_schema = os.getenv("DB_SCHEMA", "public")
         insp = inspect(self.db_connector.engine)
-        cols = [c["name"] for c in insp.get_columns(table_name, schema="public")]
+        cols = [c["name"] for c in insp.get_columns(table_name, schema=db_schema)]
         use_cols = [c for c in cols if c not in exclude_text_cols]
         col_list = ", ".join(f'"{c}"' for c in use_cols)
-        return f'SELECT {col_list} FROM "public"."{table_name}"'
+        return f'SELECT {col_list} FROM "{db_schema}"."{table_name}"'
 
     # ✔ COUNT (SELECT와 동일 조건/조인 반영해줘야 정확)
     def get_use_columns_count(self, table_name: str, exclude_text_cols: list[str] | None = None) -> str:
         # 필터/조인이 있다면 동일하게 반영해야 함 (여기선 테이블 전체 기준)
-        return f'SELECT COUNT(*) FROM "public"."{table_name}"'
+        import os
+        db_schema = os.getenv("DB_SCHEMA", "public")
+        return f'SELECT COUNT(*) FROM "{db_schema}"."{table_name}"'
 
     # ✔ PK+TEXT 최소 SELECT
     def select_pk_and_text(self, table_name: str, pk_cols: list[str], text_col: str) -> str:
+        import os
+        db_schema = os.getenv("DB_SCHEMA", "public")
         cols = ", ".join(f'"{c}"' for c in [*pk_cols, text_col])
-        return f'SELECT {cols} FROM "public"."{table_name}"'
+        return f'SELECT {cols} FROM "{db_schema}"."{table_name}"'
     
     
     

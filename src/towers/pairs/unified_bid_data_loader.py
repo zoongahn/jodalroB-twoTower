@@ -57,23 +57,32 @@ def _combine_kjts(kjt_list: List[KeyedJaggedTensor]) -> KeyedJaggedTensor:
     )
 
 def _build_batch_kjt(cat_batch: torch.Tensor, keys: List[str]) -> KeyedJaggedTensor:
-    """배치 단위로 KJT 생성 (벡터화)"""
+    """배치 단위로 KJT 생성 (key-major 순서로 수정)
+
+    CRITICAL: KeyedJaggedTensor는 key-major 순서를 기대함
+    - keys: 고유 키 리스트 (반복 금지!)
+    - values/lengths: 각 key마다 B개 값이 연속하도록 배치
+    """
     B, K = cat_batch.shape
     assert K == len(keys), f"Keys length {len(keys)} doesn't match tensor shape {K}"
-    
-    # 모든 값을 flatten
-    values = cat_batch.reshape(-1)
-    
-    # 각 항목은 길이 1
-    lengths = torch.ones(B * K, dtype=torch.int32)
-    
-    # 키를 B번 반복
-    repeated_keys = keys * B
-    
+
+    # Key-major 순서: 각 key마다 B개 값이 연속
+    values_by_key = []
+    lengths_by_key = []
+
+    for k in range(K):
+        # k번째 feature의 모든 샘플 값
+        values_by_key.append(cat_batch[:, k])  # [B]
+        lengths_by_key.append(torch.ones(B, dtype=torch.int32))  # [B]
+
+    # 모든 key의 값을 이어 붙임
+    all_values = torch.cat(values_by_key, dim=0)  # [K*B]
+    all_lengths = torch.cat(lengths_by_key, dim=0)  # [K*B]
+
     return KeyedJaggedTensor.from_lengths_sync(
-        keys=repeated_keys,
-        values=values,
-        lengths=lengths
+        keys=keys,  # NOT keys * B (고유 키 리스트만!)
+        values=all_values,
+        lengths=all_lengths
     )
 
 
@@ -162,7 +171,16 @@ class UnifiedBidDataset(Dataset):
                     # Test mode: raw stores + projection 필요
                     self.notice_store = shared_feature_stores['notice']
                     self.company_store = shared_feature_stores['company']
-                    self._build_id_mappings(self.notice_store, self.company_store)
+
+                    # CRITICAL: Test Mode에서 제공된 ID 매핑 사용 (순서 보장!)
+                    if 'pairs_data' in shared_feature_stores:
+                        pairs_data = shared_feature_stores['pairs_data']
+                        self.notice_id_to_idx = pairs_data['notice_id_to_idx']
+                        self.company_id_to_idx = pairs_data['company_id_to_idx']
+                        print("  - Test mode: 제공된 ID 매핑 사용 (순서 보장)")
+                    else:
+                        self._build_id_mappings(self.notice_store, self.company_store)
+
                     self._setup_projectors()
 
                     # Test mode: raw 데이터를 projection하여 dense_projected 생성
@@ -351,22 +369,28 @@ class UnifiedBidDataset(Dataset):
         )
             
     def _build_id_mappings(self, notice_store: Dict, company_store: Dict):
-        """ID 매핑 딕셔너리 생성"""
+        """ID 매핑 딕셔너리 생성 - 타입 정규화 보장"""
         if 'ids' not in notice_store:
             raise ValueError("notice_store에 'ids' 키가 없습니다. build_feature_store() 함수를 확인하세요.")
-        
+
         if 'ids' not in company_store:
             raise ValueError("company_store에 'ids' 키가 없습니다. build_feature_store() 함수를 확인하세요.")
-        
-        notice_ids = notice_store['ids']
-        self.notice_id_to_idx = {tuple(id_pair): idx for idx, id_pair in enumerate(notice_ids)}
-        
-        company_ids = company_store['ids']
+
+        # CRITICAL: Notice ID - tuple of str로 정규화
+        notice_ids = notice_store['ids']  # e.g. [(bidntceno, bidntceord), ...]
+        self.notice_id_to_idx = {
+            (str(a), str(b)): idx for idx, (a, b) in enumerate(notice_ids)
+        }
+
+        # CRITICAL: Company ID - str로 정규화
+        company_ids = company_store['ids']  # e.g. [bizno, ...] or [(bizno,), ...]
         if company_ids:
             if isinstance(company_ids[0], (tuple, list)):
                 self.company_id_to_idx = {str(id_tuple[0]): idx for idx, id_tuple in enumerate(company_ids)}
             else:
                 self.company_id_to_idx = {str(company_id): idx for idx, company_id in enumerate(company_ids)}
+
+        print(f"  ID 매핑 생성 완료: Notice {len(self.notice_id_to_idx)}, Company {len(self.company_id_to_idx)}")
     
     def _get_chunk_id(self, idx: int) -> int:
         """인덱스로부터 청크 ID 계산"""
@@ -474,29 +498,33 @@ class UnifiedBidDataset(Dataset):
             local_idx = idx % self.chunk_size
             chunk_arrays = self.chunk_cache[chunk_id]
 
-            bidntceno = chunk_arrays['bidntceno'][local_idx]
-            bidntceord = chunk_arrays['bidntceord'][local_idx]
+            # CRITICAL: 타입 정규화 - 모두 str로 통일
+            bidntceno = str(chunk_arrays['bidntceno'][local_idx])
+            bidntceord = str(chunk_arrays['bidntceord'][local_idx])
             bizno = str(chunk_arrays['bizno'][local_idx])
         else:
             # 정적 모드: pairs DataFrame에서 직접 조회
             pair_row = self.pairs.iloc[idx]
-            bidntceno = pair_row['bidntceno']
-            bidntceord = pair_row['bidntceord']
+            # CRITICAL: 타입 정규화 - 모두 str로 통일
+            bidntceno = str(pair_row['bidntceno'])
+            bidntceord = str(pair_row['bidntceord'])
             bizno = str(pair_row['bizno'])
-        
-        # 인덱스 조회 (Test Mode에서는 100% 매칭 보장)
+
+        # 인덱스 조회 - 타입 정규화된 키 사용
         notice_key = (bidntceno, bidntceord)
         company_key = bizno
 
-        notice_idx = self.notice_id_to_idx.get(notice_key)
-        company_idx = self.company_id_to_idx.get(company_key)
+        # CRITICAL: 매핑 실패 시 즉시 에러 (0으로 대체 금지!)
+        try:
+            notice_idx = self.notice_id_to_idx[notice_key]
+        except KeyError:
+            raise KeyError(f"[NOTICE MAPPING FAIL] key={notice_key} not in notice_id_to_idx (total mappings: {len(self.notice_id_to_idx)})")
 
-        # Test Mode에서는 누락 ID가 있으면 명확히 오류 발생
-        if notice_idx is None:
-            raise KeyError(f"Notice ID not found in features: {notice_key}")
-        if company_idx is None:
-            raise KeyError(f"Company ID not found in features: {company_key}")
-        
+        try:
+            company_idx = self.company_id_to_idx[company_key]
+        except KeyError:
+            raise KeyError(f"[COMPANY MAPPING FAIL] key={company_key} not in company_id_to_idx (total mappings: {len(self.company_id_to_idx)})")
+
         return {
             "notice_idx": notice_idx,
             "company_idx": company_idx,
@@ -627,10 +655,71 @@ def create_lightweight_collate_fn():
     return lightweight_collate_fn
 
 
+def create_safe_pair_collate_fn(dataset: 'UnifiedBidDataset', device: Optional[torch.device] = None):
+    """
+    페어 순서를 100% 보장하는 안전 collate.
+    - batch[i]의 notice/company를 같은 i 순서로 묶는다.
+    - 중간에 재정렬/병렬화 없음.
+    - 필요 시 마지막에만 GPU로 이동.
+    """
+    import numpy as np
+
+    def _to_kjt_cpu(cat_np: np.ndarray, keys: List[str]):
+        """cat_np: (B, K) numpy → KJT"""
+        cat_t = torch.from_numpy(cat_np).long()
+        return _build_batch_kjt(cat_t, keys)
+
+    def collate(batch: List[Dict]) -> Dict[str, Dict[str, torch.Tensor]]:
+        # 1) 순서 보장: 한 줄씩 뽑아서 바로 텐서화
+        n_dense_list, c_dense_list = [], []
+        n_cat_list,   c_cat_list   = [], []
+
+        for item in batch:
+            ni = item["notice_idx"]
+            ci = item["company_idx"]
+
+            # index 기반으로 같은 순서로 꺼냄 (절대 분리 처리하지 않음)
+            n_dense_list.append(dataset.notice_store['dense_projected'][ni])
+            c_dense_list.append(dataset.company_store['dense_projected'][ci])
+            n_cat_list.append(dataset.notice_store['categorical'][ni])
+            c_cat_list.append(dataset.company_store['categorical'][ci])
+
+        # 2) stack (순서 그대로 유지)
+        notice_dense  = torch.from_numpy(np.stack(n_dense_list, axis=0)).float()
+        company_dense = torch.from_numpy(np.stack(c_dense_list, axis=0)).float()
+
+        # 3) KJT (CPU에서 생성 후 필요 시 GPU로)
+        notice_cat_np  = np.stack(n_cat_list, axis=0)   # (B, K_n)
+        company_cat_np = np.stack(c_cat_list, axis=0)   # (B, K_c)
+        notice_kjt  = _to_kjt_cpu(notice_cat_np,  dataset.schema.notice.categorical)
+        company_kjt = _to_kjt_cpu(company_cat_np, dataset.schema.company.categorical)
+
+        batch_out = {
+            "notice":  {"dense": notice_dense,  "kjt": notice_kjt},
+            "company": {"dense": company_dense, "kjt": company_kjt},
+        }
+
+        # 4) 마지막에만 장치 이동 (필요 시)
+        if device is not None:
+            batch_out["notice"]["dense"]  = batch_out["notice"]["dense"].to(device, non_blocking=True)
+            batch_out["company"]["dense"] = batch_out["company"]["dense"].to(device, non_blocking=True)
+            if hasattr(notice_kjt, "to"):
+                batch_out["notice"]["kjt"] = notice_kjt.to(device)
+            if hasattr(company_kjt, "to"):
+                batch_out["company"]["kjt"] = company_kjt.to(device)
+
+        return batch_out
+
+    return collate
+
+
 def create_collate_fn(dataset: 'UnifiedBidDataset'):
-    """GPU 최적화 collate 함수 - load_all_features=True, streaming=True 전용"""
+    """GPU 최적화 collate 함수 - load_all_features=True, streaming=True 전용
+
+    WARNING: 이 함수는 순서 보장이 약함. create_safe_pair_collate_fn 사용 권장!
+    """
     from concurrent.futures import ThreadPoolExecutor
-    
+
     def collate_fn_gpu_optimized(batch: List[Dict]) -> Dict[str, Dict[str, torch.Tensor]]:
         # 배치에서 인덱스들 추출
         notice_indices = [item["notice_idx"] for item in batch]
@@ -804,38 +893,52 @@ def _build_batch_kjt_original(categorical_data: torch.Tensor, categorical_keys: 
 
 
 def _build_batch_kjt_gpu(categorical_data: torch.Tensor, categorical_keys: List[str]) -> 'KeyedJaggedTensor':
-    """GPU 기반 배치용 KJT 생성 (최적화 버전)"""
+    """GPU 기반 배치용 KJT 생성 (key-major 순서로 수정)"""
     from torchrec import KeyedJaggedTensor
-    
+
     # GPU로 이전
     if categorical_data.device.type != 'cuda':
         categorical_data = categorical_data.cuda()
-    
-    batch_size, num_features = categorical_data.shape
-    
-    # GPU에서 메모리 할당 및 reshape
-    all_values = categorical_data.flatten()
-    all_lengths = torch.ones(batch_size * num_features, dtype=torch.long, device=categorical_data.device)
-    
+
+    B, K = categorical_data.shape
+
+    # Key-major 순서: 각 key마다 B개 값이 연속
+    values_by_key = []
+    lengths_by_key = []
+
+    for k in range(K):
+        values_by_key.append(categorical_data[:, k])  # [B]
+        lengths_by_key.append(torch.ones(B, dtype=torch.long, device=categorical_data.device))  # [B]
+
+    all_values = torch.cat(values_by_key, dim=0)  # [K*B]
+    all_lengths = torch.cat(lengths_by_key, dim=0)  # [K*B]
+
     return KeyedJaggedTensor.from_lengths_sync(
-        keys=categorical_keys,
+        keys=categorical_keys,  # 고유 키 리스트만!
         values=all_values,
         lengths=all_lengths
     )
 
 
 def _build_batch_kjt(categorical_data: torch.Tensor, categorical_keys: List[str]) -> 'KeyedJaggedTensor':
-    """배치용 KJT 생성 (CPU 버전 - 호환성 유지)"""
+    """배치용 KJT 생성 (CPU 버전 - key-major 순서로 수정)"""
     from torchrec import KeyedJaggedTensor
-    
-    batch_size, num_features = categorical_data.shape
-    
-    # 최적화: 한 번에 메모리 할당 및 reshape
-    all_values = categorical_data.flatten()
-    all_lengths = torch.ones(batch_size * num_features, dtype=torch.long)
-    
+
+    B, K = categorical_data.shape
+
+    # Key-major 순서: 각 key마다 B개 값이 연속
+    values_by_key = []
+    lengths_by_key = []
+
+    for k in range(K):
+        values_by_key.append(categorical_data[:, k])  # [B]
+        lengths_by_key.append(torch.ones(B, dtype=torch.long))  # [B]
+
+    all_values = torch.cat(values_by_key, dim=0)  # [K*B]
+    all_lengths = torch.cat(lengths_by_key, dim=0)  # [K*B]
+
     return KeyedJaggedTensor.from_lengths_sync(
-        keys=categorical_keys,
+        keys=categorical_keys,  # 고유 키 리스트만!
         values=all_values,
         lengths=all_lengths
     )
@@ -940,9 +1043,9 @@ def create_unified_bid_dataloaders_gpu(
         shared_feature_stores=shared_stores,
     )
     
-    # GPU collate 함수 사용
-    train_collate_fn = create_collate_fn_gpu(train_dataset)
-    
+    # 순서 보장 collate 함수 사용
+    train_collate_fn = create_safe_pair_collate_fn(train_dataset)
+
     # DataLoader (pin_memory=False 필수)
     train_loader = DataLoader(
         dataset=train_dataset,
@@ -952,10 +1055,10 @@ def create_unified_bid_dataloaders_gpu(
         num_workers=0,
         pin_memory=False  # GPU 버전에서는 False
     )
-    
+
     test_loader = None
     if test_dataset is not None:
-        test_collate_fn = create_collate_fn_gpu(test_dataset)
+        test_collate_fn = create_safe_pair_collate_fn(test_dataset)
         test_loader = DataLoader(
             dataset=test_dataset,
             batch_size=batch_size,
@@ -1094,14 +1197,14 @@ def create_unified_bid_dataloaders(
             shared_feature_stores=shared_stores,
             )
     
-    # 데이터셋에 맞는 collate 함수 생성
-    train_collate_fn = create_collate_fn(train_dataset)
-    
+    # 데이터셋에 맞는 collate 함수 생성 (순서 보장 버전 사용!)
+    train_collate_fn = create_safe_pair_collate_fn(train_dataset)
+
     # DataLoader 파라미터 (멀티프로세스 지원)
     train_loader = DataLoader(
         dataset=train_dataset,
         batch_size=batch_size,
-        shuffle=False,
+        shuffle=False,  # CRITICAL: Two-Tower에서는 pair 순서 유지 필수
         collate_fn=train_collate_fn,
         num_workers=num_workers,
         pin_memory=pin_memory,
@@ -1111,13 +1214,13 @@ def create_unified_bid_dataloaders(
     
     test_loader = None
     if test_dataset is not None:
-        test_collate_fn = create_collate_fn(test_dataset)
-        
+        test_collate_fn = create_safe_pair_collate_fn(test_dataset)
+
         # Test DataLoader (멀티프로세스 지원)
         test_loader = DataLoader(
             dataset=test_dataset,
             batch_size=batch_size,
-            shuffle=False,
+            shuffle=False,  # CRITICAL: 검증 시에도 pair 순서 유지 필수
             collate_fn=test_collate_fn,
             num_workers=num_workers,
             pin_memory=pin_memory,
@@ -1136,9 +1239,8 @@ if __name__ == "__main__":
     db = DatabaseConnector()
     engine = db.engine
     
+    # 스키마 구축 (.env에서 자동으로 설정 읽음)
     config = {
-        "notice_table": "notice", "company_table": "company", 
-        "pair_table": "bid_two_tower",
         "pair_notice_id_cols": ["bidntceno", "bidntceord"],
         "pair_company_id_cols": ["bizno"],
         "metadata_path": "meta/metadata.csv"
@@ -1184,7 +1286,7 @@ def _create_test_mode_dataloaders(
     print("📊 제한된 pair 데이터 로딩 중...")
     pair_query = f"""
     SELECT bidntceno, bidntceord, bizno, id
-    FROM bid_two_tower
+    FROM {schema.pair.table}
     """
     if pair_limit:
         pair_query += f" LIMIT {pair_limit}"
@@ -1212,11 +1314,14 @@ def _create_test_mode_dataloaders(
         db_engine, schema.company, company_ids, "company", show_progress=True
     )
 
-    # 4. ID 매핑 생성 (선택된 ID만)
-    notice_id_to_idx = {id_tuple: idx for idx, id_tuple in enumerate(notice_ids)}
-    company_id_to_idx = {str(id_val): idx for idx, id_val in enumerate(company_ids)}
+    # 4. ID 매핑 생성 (CRITICAL: feature store의 'ids' 순서와 일치시켜야 함!)
+    # Set을 enumerate하면 순서가 보장되지 않으므로, store의 ids를 사용
+    notice_id_to_idx = {tuple(id_pair): idx for idx, id_pair in enumerate(notice_store['ids'])}
+    company_id_to_idx = {str(id_val[0] if isinstance(id_val, (tuple, list)) else id_val): idx
+                         for idx, id_val in enumerate(company_store['ids'])}
 
     print(f"✅ 매칭 보장: Notice {len(notice_id_to_idx)}, Company {len(company_id_to_idx)}")
+    print(f"   (Feature store 'ids' 순서 기준으로 매핑 생성)")
 
     # 5. Train/Test 분할
     train_pairs, test_pairs = None, None
@@ -1268,14 +1373,14 @@ def _create_test_mode_dataloaders(
             shared_feature_stores=shared_stores,
         )
 
-    # 8. Collate 함수 선택
-    train_collate_fn = create_collate_fn(train_dataset)
+    # 8. Collate 함수 선택 (순서 보장 버전 사용!)
+    train_collate_fn = create_safe_pair_collate_fn(train_dataset)
 
     # 9. DataLoader 생성
     train_loader = DataLoader(
         dataset=train_dataset,
         batch_size=batch_size,
-        shuffle=True,  # Test mode에서도 셔플 허용
+        shuffle=False,  # CRITICAL: Two-Tower에서는 notice-company pair 정렬을 유지해야 함
         collate_fn=train_collate_fn,
         num_workers=num_workers,
         pin_memory=pin_memory,
@@ -1285,7 +1390,7 @@ def _create_test_mode_dataloaders(
 
     test_loader = None
     if test_dataset is not None:
-        test_collate_fn = create_collate_fn(test_dataset)
+        test_collate_fn = create_safe_pair_collate_fn(test_dataset)
         test_loader = DataLoader(
             dataset=test_dataset,
             batch_size=batch_size,
@@ -1311,12 +1416,19 @@ def _load_features_for_test_mode(
     table_type: str,  # "notice" 또는 "company"
     show_progress: bool = False
 ) -> Dict:
-    """Test Mode용 선택적 피처 로딩 (SQL WHERE 조건절 사용)"""
+    """Test Mode용 선택적 피처 로딩 (SQL WHERE 조건절 사용)
 
-    id_list = list(target_ids)
-    print(f"Loading {table_type}: {len(id_list):,}개")
+    CRITICAL: ID 순서 일관성 보장
+    - target_ids를 정렬된 순서로 변환
+    - store['ids']와 다른 배열들의 행 순서가 동일하도록 보장
+    """
 
+    # CRITICAL: ID를 정렬된 리스트로 변환 (순서 일관성)
     if table_type == "notice":
+        # Notice: tuple of str로 정렬
+        id_list = sorted(list(target_ids), key=lambda x: (str(x[0]), str(x[1])))
+        print(f"Loading {table_type}: {len(id_list):,}개 (정렬된 순서)")
+
         # Notice ID 조건 생성 (tuples of bidntceno, bidntceord)
         conditions = []
         for bidntceno, bidntceord in id_list:
@@ -1324,6 +1436,10 @@ def _load_features_for_test_mode(
         where_condition = " OR ".join(conditions)
 
     elif table_type == "company":
+        # Company: str로 정렬
+        id_list = sorted(list(target_ids), key=lambda x: str(x))
+        print(f"Loading {table_type}: {len(id_list):,}개 (정렬된 순서)")
+
         # Company ID 조건 생성 (bizno IN clause)
         quoted_ids = [f"'{cid}'" for cid in id_list]
         where_condition = "bizno IN (" + ",".join(quoted_ids) + ")"
@@ -1336,9 +1452,29 @@ def _load_features_for_test_mode(
         db_engine, schema_part, where_condition=where_condition, show_progress=show_progress
     )
 
+    # CRITICAL: store의 모든 배열을 ids 순서로 정렬 (일관성 보장)
+    if 'ids' in store:
+        # ids 기준으로 정렬 순서 계산
+        if table_type == "notice":
+            # Notice: tuple of str 기준
+            sort_order = sorted(range(len(store['ids'])),
+                              key=lambda i: (str(store['ids'][i][0]), str(store['ids'][i][1])))
+        else:
+            # Company: str 기준
+            sort_order = sorted(range(len(store['ids'])),
+                              key=lambda i: str(store['ids'][i][0] if isinstance(store['ids'][i], (tuple, list)) else store['ids'][i]))
+
+        # 모든 배열을 동일한 순서로 정렬
+        for key in ['ids', 'numeric', 'categorical', 'text', 'dense_projected']:
+            if key in store:
+                if isinstance(store[key], np.ndarray):
+                    store[key] = store[key][sort_order]
+                elif isinstance(store[key], list):
+                    store[key] = [store[key][i] for i in sort_order]
+
     # 디버깅: store 내용 확인
     available_keys = list(store.keys())
-    print(f"✅ {table_type.capitalize()} 피처 로딩 완료")
+    print(f"✅ {table_type.capitalize()} 피처 로딩 완료 (정렬 적용)")
     print(f"   Available keys: {available_keys}")
     for key in available_keys:
         if hasattr(store[key], '__len__'):

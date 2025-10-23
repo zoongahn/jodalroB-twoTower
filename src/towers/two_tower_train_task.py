@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from typing import Dict, Optional, Tuple, Union
 
 from src.towers.two_tower_model import TwoTowerModel
+from src.towers.contrastive_head import diag_consistency_report
 
 
 class TwoTowerTrainTask(nn.Module):
@@ -67,34 +68,66 @@ class TwoTowerTrainTask(nn.Module):
             )
         
         batch_size = notice_batch_size
-        
-        # 2) 임베딩 계산
-        notice_embeddings, company_embeddings = self.two_tower_model(
-            notice_input, company_input
-        )
-        
-        # 3) 유사도 행렬 계산 (In-batch negative sampling)
-        similarity_matrix = self._compute_similarity_matrix(
-            notice_embeddings, company_embeddings
-        )  # [B, B]
-        
-        # 4) Positive pair 정합성 검증 (최초 1회만)
-        if not hasattr(self, '_pair_check_done'):
-            self._verify_positive_pair_alignment(similarity_matrix)
-            self._pair_check_done = True
 
-        # 5) 손실 계산
-        loss = self._compute_loss(similarity_matrix, batch_size)
+        # 2) 모델 forward: 임베딩 + Contrastive Head를 통한 로짓 계산
+        result = self.two_tower_model(
+            notice_input, company_input, return_logits=True
+        )
+
+        if len(result) == 3:
+            notice_embeddings, company_embeddings, logits = result
+        else:
+            # Fallback: 구형 시그니처 대비
+            notice_embeddings, company_embeddings = result
+            logits = self.two_tower_model.contrastive_head(notice_embeddings, company_embeddings)
+
+        # 3) Positive pair 정합성 검증 (최초 2회만 - 디버깅용)
+        if not hasattr(self, '_pair_check_count'):
+            self._pair_check_count = 0
+
+        if self._pair_check_count < 2:
+            print(f"\n🔍 [Step {self._pair_check_count}] Positive Pair Alignment Check")
+            z_gap = diag_consistency_report(
+                notice_embeddings, company_embeddings,
+                log_prefix=f"[diag@step{self._pair_check_count}]"
+            )
+            self._pair_check_count += 1
+
+        # 4) 손실 계산 (in-batch negative sampling)
+        loss = self._compute_loss_with_logits(logits, batch_size)
         
         if return_metrics:
-            metrics = self._compute_metrics(similarity_matrix, batch_size)
+            metrics = self._compute_metrics(logits, batch_size)
             return {
                 "loss": loss,
                 **metrics,
-                "similarity_matrix": similarity_matrix.detach()
+                "similarity_matrix": logits.detach()
             }
         else:
             return loss
+
+    def _compute_loss_with_logits(self, logits: torch.Tensor, batch_size: int) -> torch.Tensor:
+        """
+        Contrastive Head로부터 얻은 로짓으로 손실 계산
+
+        Args:
+            logits: Temperature-scaled similarity matrix [B, B]
+            batch_size: 배치 크기
+
+        Returns:
+            loss: 양방향 Cross Entropy Loss
+        """
+        # In-batch negative sampling: 대각선이 positive pair
+        labels = torch.arange(batch_size, device=logits.device)
+
+        # 양방향 Cross Entropy Loss
+        loss_i2t = F.cross_entropy(logits, labels, label_smoothing=self.label_smoothing)
+        loss_t2i = F.cross_entropy(logits.T, labels, label_smoothing=self.label_smoothing)
+
+        # 평균으로 결합
+        loss = 0.5 * (loss_i2t + loss_t2i)
+
+        return loss
     
     def _compute_similarity_matrix(
         self, 

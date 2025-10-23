@@ -5,6 +5,7 @@ from pathlib import Path
 
 from src.towers.tower.notice_tower import NoticeTower
 from src.towers.tower.company_tower import CompanyTower
+from src.towers.contrastive_head import ContrastiveHead
 
 
 class TwoTowerModel(nn.Module):
@@ -17,85 +18,87 @@ class TwoTowerModel(nn.Module):
         company_tower_config: Dict,
         final_embedding_dim: int = 128,
         device: Optional[torch.device] = "cuda:0",
+        init_temperature: float = 0.07,
+        learnable_temperature: bool = True,
     ):
         """
         Args:
             notice_tower_config: Notice Tower 설정 dict
-            company_tower_config: Company Tower 설정 dict  
+            company_tower_config: Company Tower 설정 dict
             final_embedding_dim: 최종 임베딩 차원 (두 타워 동일해야 함)
             device: 디바이스
+            init_temperature: Contrastive head 초기 temperature
+            learnable_temperature: Temperature를 학습 가능하게 할지 여부
         """
         super().__init__()
-        
+
         self.device = device
         self.final_embedding_dim = final_embedding_dim
-        
+
         # 두 타워 생성
         self.notice_tower = NoticeTower(**notice_tower_config)
         self.company_tower = CompanyTower(**company_tower_config)
-        
+
+        # Contrastive Learning Head 추가
+        self.contrastive_head = ContrastiveHead(
+            init_tau=init_temperature,
+            learnable=learnable_temperature
+        )
+
         # 최종 임베딩 차원이 동일한지 확인
         assert notice_tower_config.get("final_embedding_dim", 128) == final_embedding_dim
         assert company_tower_config.get("final_embedding_dim", 128) == final_embedding_dim
-        
+
         self.to(torch.device(self.device))
         
     def forward(
-        self, 
-        notice_input: Dict[str, torch.Tensor], 
+        self,
+        notice_input: Dict[str, torch.Tensor],
         company_input: Dict[str, torch.Tensor],
-        return_similarity: bool = False,
-        temperature: float = 1.0
-    ) -> Union[Tuple[torch.Tensor, torch.Tensor], Dict[str, torch.Tensor]]:
+        return_logits: bool = False,
+        return_similarity: bool = False,  # Backward compatibility
+        temperature: float = None  # Deprecated, use contrastive_head's learnable temperature
+    ) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, torch.Tensor], Dict[str, torch.Tensor]]:
         """
         Args:
             notice_input: Notice Tower 입력 {"dense": Tensor, "kjt": KJT}
-            company_input: Company Tower 입력 {"dense": Tensor, "kjt": KJT}  
-            return_similarity: True면 유사도 행렬도 함께 반환
-            temperature: 유사도 계산시 temperature scaling
-        
+            company_input: Company Tower 입력 {"dense": Tensor, "kjt": KJT}
+            return_logits: True면 contrastive head를 통과한 로짓도 반환
+            return_similarity: (Deprecated) Backward compatibility용
+            temperature: (Deprecated) contrastive_head의 learnable temperature 사용 권장
+
         Returns:
-            return_similarity=False: (notice_emb, company_emb)
-            return_similarity=True: {
-                "notice_emb": Tensor [B, D],
-                "company_emb": Tensor [B, D], 
-                "similarity_matrix": Tensor [B, B]
-            }
+            return_logits=False: (notice_emb, company_emb)
+            return_logits=True: (notice_emb, company_emb, logits)
         """
-        
+
         # 1) 각 타워에서 임베딩 계산
         notice_embeddings = self.notice_tower(notice_input)    # [B, final_embedding_dim]
         company_embeddings = self.company_tower(company_input)  # [B, final_embedding_dim]
-        
+
         # 2) 배치 크기 검증
         batch_size_notice = notice_embeddings.size(0)
         batch_size_company = company_embeddings.size(0)
-        
+
         if batch_size_notice != batch_size_company:
             raise ValueError(
                 f"Notice와 Company 배치 크기가 다릅니다: "
                 f"{batch_size_notice} vs {batch_size_company}"
             )
-        
-        # 3) 임베딩이 정규화되었는지 확인 (BaseTower에서 L2 정규화 수행)
-        notice_norms = torch.norm(notice_embeddings, p=2, dim=1)
-        company_norms = torch.norm(company_embeddings, p=2, dim=1)
-        
-        if not torch.allclose(notice_norms, torch.ones_like(notice_norms), atol=1e-4):
-            print("Warning: Notice embeddings are not L2 normalized")
-        if not torch.allclose(company_norms, torch.ones_like(company_norms), atol=1e-4):
-            print("Warning: Company embeddings are not L2 normalized")
-        
-        # 4) 유사도 계산 여부에 따라 반환
-        if return_similarity:
-            # 코사인 유사도 행렬 계산 (L2 정규화된 벡터이므로)
-            similarity_matrix = torch.mm(notice_embeddings, company_embeddings.t()) / temperature
-            
-            return {
-                "notice_embeddings": notice_embeddings,
-                "company_embeddings": company_embeddings,
-                "similarity_matrix": similarity_matrix
-            }
+
+        # 3) Contrastive Head를 통한 로짓 계산 (필요시)
+        if return_logits or return_similarity:
+            logits = self.contrastive_head(notice_embeddings, company_embeddings)
+
+            if return_logits:
+                return notice_embeddings, company_embeddings, logits
+            else:
+                # Backward compatibility
+                return {
+                    "notice_embeddings": notice_embeddings,
+                    "company_embeddings": company_embeddings,
+                    "similarity_matrix": logits
+                }
         else:
             return notice_embeddings, company_embeddings
     

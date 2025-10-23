@@ -24,20 +24,30 @@ class FeatureStore:
 
 
     def build(self, show_progress: bool = True):
+        # 테이블명 처리: schema.table_preprocessed 형식으로 변환
+        table_parts = self.sch.table.split('.')
+        if len(table_parts) == 2:
+            # schema.table 형식
+            schema_name, table_name = table_parts
+            full_table = f"{schema_name}.{table_name}_preprocessed"
+        else:
+            # table만 있는 경우
+            full_table = f"{self.sch.table}_preprocessed"
+
         # 먼저 총 행 수 계산 (진행도 표시용)
         if show_progress:
             if self.limit:
                 total_rows = self.limit
             else:
-                count_sql = f"SELECT COUNT(*) FROM {self.sch.table}_preprocessed"
+                count_sql = f"SELECT COUNT(*) FROM {full_table}"
                 if self.where_condition:
                     count_sql += f" WHERE {self.where_condition}"
                 with self.engine.connect() as cx:
                     total_rows = cx.execute(text(count_sql)).scalar()
-            
+
             from tqdm import tqdm
             pbar = tqdm(total=total_rows, desc=f"Loading {self.sch.table}", unit="rows")
-        
+
         # 필요한 컬럼만 SELECT
         cols = self.sch.pk_cols + self.sch.numeric + self.sch.categorical
         if self.sch.text:
@@ -46,7 +56,7 @@ class FeatureStore:
                 cols.append(vec_select)
 
         select_cols = ", ".join([c if "::" in c else c for c in cols])
-        sql = f"SELECT {select_cols} FROM {self.sch.table}_preprocessed"
+        sql = f"SELECT {select_cols} FROM {full_table}"
         if self.where_condition:
             sql += f" WHERE {self.where_condition}"
         if self.limit:
@@ -189,18 +199,16 @@ if __name__ == "__main__":
 
     db = DatabaseConnector()
     engine = db.engine
-    
+
+    # 스키마 구축 (.env에서 자동으로 설정 읽음)
     schema = build_torchrec_schema_from_meta(
-        notice_table="notice",
-        company_table="company",
-        pair_table="bid_two_tower",
         pair_notice_id_cols=["bidntceno", "bidntceord"],
         pair_company_id_cols=["bizno"],
         metadata_path="meta/metadata.csv",
     )
-    
+
     notice_schema = schema.notice
-    
+
     result = build_feature_store(engine, notice_schema, chunksize=1000, limit=10000)
-    
+
     print(result)

@@ -212,11 +212,8 @@ if __name__ == "__main__":
     # 테스트용 코드
     from src.torchrec_preprocess.schema import build_torchrec_schema_from_meta
     
-    # 스키마 로드
+    # 스키마 로드 (.env에서 자동으로 설정 읽음)
     schema = build_torchrec_schema_from_meta(
-        notice_table="notice",
-        company_table="company",
-        pair_table="bid_two_tower",
         pair_notice_id_cols=["bidntceno", "bidntceord"],
         pair_company_id_cols=["bizno"],
         metadata_path="meta/metadata.csv",

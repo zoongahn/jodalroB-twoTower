@@ -24,7 +24,7 @@ class SideSchema:
 
 @dataclass
 class PairSchema:
-    table: str = "bid_two_tower"
+    table: str = "step1.bid_two_tower"
     notice_id_cols: List[str] = field(default_factory=list)    # 페어 테이블의 공고 FK 컬럼들
     company_id_cols: List[str] = field(default_factory=list)   # 페어 테이블의 업체 FK 컬럼들
 
@@ -34,12 +34,28 @@ class TorchRecSchema:
     company: SideSchema
     pair: PairSchema
 
-def build_side_schema_from_meta(table_name: str, metadata_path: str | Path = "meta/metadata.csv") -> SideSchema:
+def build_side_schema_from_meta(table_name: str, metadata_path: str | Path = "meta/metadata.csv", schema: str = None) -> SideSchema:
     """
     meta/metadata.csv에서 table_name 행만 읽어 스키마 구성.
     classify_columns(table) 결과 예:
       { "total": 68, "pk": [...], "numeric": [...], "categorical": [...], "text": [...] }
+
+    Args:
+        table_name: 테이블명 (예: "notice", "company")
+        metadata_path: 메타데이터 파일 경로
+        schema: DB 스키마명 (None이면 .env에서 읽음)
     """
+    import os
+    from dotenv import load_dotenv
+    load_dotenv()
+
+    # 스키마 설정
+    if schema is None:
+        schema = os.getenv("DB_SCHEMA", "public")
+
+    # 전체 테이블명 (스키마.테이블)
+    full_table_name = f"{schema}.{table_name}"
+
     md = classify_columns(table_name, metadata_path)
     pk_cols = md.get("pk", []) or []
     numeric = md.get("numeric", []) or []
@@ -53,7 +69,7 @@ def build_side_schema_from_meta(table_name: str, metadata_path: str | Path = "me
     text = [c for c in text if c not in pk_set]
 
     return SideSchema(
-        table=table_name,
+        table=full_table_name,  # 스키마.테이블 형식으로 저장
         pk_cols=pk_cols,
         numeric=numeric,
         categorical=categorical,
@@ -65,23 +81,54 @@ def build_side_schema_from_meta(table_name: str, metadata_path: str | Path = "me
 
 def build_torchrec_schema_from_meta(
     *,
-    notice_table: str,
-    company_table: str,
-    pair_table: str,
+    notice_table: str = None,
+    company_table: str = None,
+    pair_table: str = None,
     # 페어 테이블의 FK 컬럼명들(복합키면 리스트로 모두 지정)
-    pair_notice_id_cols: List[str],     # ex) ["bidntceno", "bidntceord"]
-    pair_company_id_cols: List[str],    # ex) ["company_id"]
+    pair_notice_id_cols: List[str] = None,     # ex) ["bidntceno", "bidntceord"]
+    pair_company_id_cols: List[str] = None,    # ex) ["company_id"]
     metadata_path: str | Path = "meta/metadata.csv",
+    schema: str = None,  # DB 스키마명 (None이면 .env에서 읽음)
 ) -> TorchRecSchema:
-    notice = build_side_schema_from_meta(notice_table, metadata_path)
-    company = build_side_schema_from_meta(company_table, metadata_path)
+    """
+    TorchRec 스키마 생성 - .env에서 설정을 읽어 사용
+
+    Args:
+        notice_table: 공고 테이블명 (None이면 .env에서 읽음)
+        company_table: 업체 테이블명 (None이면 .env에서 읽음)
+        pair_table: 페어 테이블명 (None이면 .env에서 읽음)
+        pair_notice_id_cols: 페어 테이블의 공고 FK 컬럼들
+        pair_company_id_cols: 페어 테이블의 업체 FK 컬럼들
+        metadata_path: 메타데이터 파일 경로
+        schema: DB 스키마명 (None이면 .env에서 읽음)
+    """
+    import os
+    from dotenv import load_dotenv
+    load_dotenv()
+
+    # .env에서 기본값 읽기
+    if schema is None:
+        schema = os.getenv("DB_SCHEMA", "public")
+    if notice_table is None:
+        notice_table = os.getenv("NOTICE_TABLE", "notice")
+    if company_table is None:
+        company_table = os.getenv("COMPANY_TABLE", "company")
+    if pair_table is None:
+        pair_table = os.getenv("BID_TWO_TOWER_TABLE", "bid_two_tower")
+
+    # 스키마 생성
+    notice = build_side_schema_from_meta(notice_table, metadata_path, schema)
+    company = build_side_schema_from_meta(company_table, metadata_path, schema)
 
     # FK 컬럼이 메타에서 자동 추론되지 않으므로, 외부에서 넘기지 않으면 공고/업체의 PK를 기본으로 사용
     notice_fk = pair_notice_id_cols if pair_notice_id_cols is not None else notice.pk_cols
     company_fk = pair_company_id_cols if pair_company_id_cols is not None else company.pk_cols
 
+    # pair 테이블 전체명
+    full_pair_table = f"{schema}.{pair_table}"
+
     pair = PairSchema(
-        table=pair_table,
+        table=full_pair_table,
         notice_id_cols=notice_fk,
         company_id_cols=company_fk,
     )
@@ -93,11 +140,8 @@ if __name__ == "__main__":
     from pprint import pprint
     from pathlib import Path
 
-    # 1) 스키마 생성
+    # 1) 스키마 생성 (.env에서 자동으로 설정 읽음)
     schema = build_torchrec_schema_from_meta(
-        notice_table="notice",
-        company_table="company",
-        pair_table="bid_two_tower",
         pair_notice_id_cols=["bidntceno", "bidntceord"],
         pair_company_id_cols=["bizno"],
         metadata_path="meta/metadata.csv",

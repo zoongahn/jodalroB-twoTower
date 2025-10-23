@@ -128,16 +128,13 @@ def main():
     db = DatabaseConnector()
     engine = db.engine
     
-    # 스키마 구축
+    # 스키마 구축 (.env에서 자동으로 설정 읽음)
     config = {
-        "notice_table": "notice",
-        "company_table": "company", 
-        "pair_table": "bid_two_tower",
         "pair_notice_id_cols": ["bidntceno", "bidntceord"],
         "pair_company_id_cols": ["bizno"],
         "metadata_path": "meta/metadata.csv"
     }
-    
+
     schema = build_torchrec_schema_from_meta(**config)
     
     # 테스트 설정

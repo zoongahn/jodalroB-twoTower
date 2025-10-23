@@ -335,11 +335,9 @@ def get_tower_input(db_engine: Engine, schema: SideSchema, tower_name: str, chun
 def preprocess_all(db_engine: Engine, schema_config: dict=None):
     print("device:", device)
     
+    # 스키마 설정 (.env에서 자동으로 설정 읽음)
     if schema_config is None:
         schema_config = {
-            "notice_table": "notice",
-            "company_table": "company", 
-            "pair_table": "bid_two_tower",
             "pair_notice_id_cols": ["bidntceno", "bidntceord"],
             "pair_company_id_cols": ["bizno"],
             "metadata_path": "meta/metadata.csv"

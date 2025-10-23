@@ -96,7 +96,7 @@ def main():
         "chunk_size": 1000000,
         "feature_chunksize": 1000,
         "use_preprocessor": True,
-        "test_mode": True,          # 빠진 중요 하이퍼파라미터!
+        "test_mode": True,          
         "prefetch_factor": 2,
 
         # 모델 아키텍처
@@ -134,7 +134,8 @@ def main():
     }
 
     print(f"🔧 설정된 하이퍼파라미터:")
-    print(f"   - Test Mode: {config['test_mode']} (Pair Limit: {config['pair_limit']:,})")
+    pair_limit_str = f"{config['pair_limit']:,}" if config['pair_limit'] is not None else "전체"
+    print(f"   - Test Mode: {config['test_mode']} (Pair Limit: {pair_limit_str})")
     print(f"   - Batch Size: {config['batch_size']}")
     print(f"   - Embedding Dim: {config['categorical_embedding_dim']} → {config['final_embedding_dim']}")
     print(f"   - Hidden Dims: {config['tower_hidden_dims']}")
@@ -159,12 +160,9 @@ def main():
     db = DatabaseConnector()
     engine = db.engine
     
-    # 3. 스키마 구축
+    # 3. 스키마 구축 (.env에서 자동으로 설정 읽음)
     print("스키마 구축 중...")
     schema_config = {
-        "notice_table": "notice",
-        "company_table": "company",
-        "pair_table": "bid_two_tower",
         "pair_notice_id_cols": ["bidntceno", "bidntceord"],
         "pair_company_id_cols": ["bizno"],
         "metadata_path": "meta/metadata.csv"
