@@ -12,6 +12,7 @@ from pathlib import Path
 import pandas as pd
 from datetime import datetime
 import os
+import argparse
 
 # Project imports
 from data.database_connector import DatabaseConnector
@@ -75,57 +76,104 @@ def save_training_results(hyperparams, metrics, output_file="train_results.csv")
     print(f"학습 결과 저장 완료: {len(updated_df)}행")
 
 
+def parse_args():
+    """커맨드 라인 인자 파싱"""
+    parser = argparse.ArgumentParser(description="Two-Tower 모델 학습 스크립트")
+
+    # 데이터 설정
+    parser.add_argument("--batch_size", type=int, default=256, help="배치 크기")
+    parser.add_argument("--test_split", type=float, default=0.2, help="테스트 데이터 비율")
+    parser.add_argument("--shuffle_seed", type=int, default=42, help="랜덤 시드")
+    parser.add_argument("--pair_limit", type=lambda x: None if x.lower() == 'none' else int(x),
+                        default=1000000, help="학습에 사용할 최대 페어 수 (none이면 전체 데이터 사용)")
+
+    # DataLoader 설정
+    parser.add_argument("--num_workers", type=int, default=0, help="DataLoader 워커 수")
+    parser.add_argument("--pin_memory", action="store_true", default=False, help="Pin memory 사용")
+    parser.add_argument("--streaming", action="store_true", default=False, help="스트리밍 모드 사용")
+    parser.add_argument("--test_mode", action="store_true", default=True, help="테스트 모드 (pair_limit 사용)")
+    parser.add_argument("--no_test_mode", dest="test_mode", action="store_false", help="테스트 모드 비활성화")
+
+    # 모델 아키텍처
+    parser.add_argument("--categorical_embedding_dim", type=int, default=32, help="범주형 임베딩 차원")
+    parser.add_argument("--final_embedding_dim", type=int, default=128, help="최종 임베딩 차원")
+    parser.add_argument("--dropout_rate", type=float, default=0.1, help="드롭아웃 비율")
+    parser.add_argument("--temperature", type=float, default=1.0, help="소프트맥스 온도")
+
+    # 학습 설정
+    parser.add_argument("--learning_rate", type=float, default=1e-3, help="학습률")
+    parser.add_argument("--weight_decay", type=float, default=1e-5, help="가중치 감쇠")
+    parser.add_argument("--num_epochs", type=int, default=1, help="학습 에포크 수")
+    parser.add_argument("--warmup_ratio", type=float, default=0.05, help="Warmup 비율")
+    parser.add_argument("--log_interval", type=int, default=20, help="로그 출력 간격")
+
+    # 모델 저장/로딩
+    parser.add_argument("--output_dir", type=str, default="output/models", help="모델 저장 디렉토리")
+    parser.add_argument("--save_best", action="store_true", default=True, help="최고 성능 모델 저장")
+    parser.add_argument("--save_final", action="store_true", default=True, help="최종 모델 저장")
+
+    # CUDA 최적화
+    parser.add_argument("--enable_tf32", action="store_true", default=True, help="TF32 활성화")
+    parser.add_argument("--enable_cudnn_benchmark", action="store_true", default=True, help="cuDNN benchmark 활성화")
+    parser.add_argument("--enable_torch_compile", action="store_true", default=False, help="torch.compile 활성화")
+
+    return parser.parse_args()
+
+
 def main():
+    # 커맨드 라인 인자 파싱
+    args = parse_args()
+
     print("=== Two-Tower 모델 학습 시작 ===")
 
     # ===========================================
-    # 하이퍼파라미터 설정 (중앙 관리)
+    # 하이퍼파라미터 설정 (커맨드 라인 인자 우선)
     # ===========================================
     config = {
         # 데이터 설정
-        "batch_size": 256,
-        "test_split": 0.2,
-        "shuffle_seed": 42,
-        "pair_limit": 1000000,
+        "batch_size": args.batch_size,
+        "test_split": args.test_split,
+        "shuffle_seed": args.shuffle_seed,
+        "pair_limit": args.pair_limit,
 
         # DataLoader 설정
-        "num_workers": 0,
-        "pin_memory": False,
-        "streaming": False,
+        "num_workers": args.num_workers,
+        "pin_memory": args.pin_memory,
+        "streaming": args.streaming,
         "load_all_features": True,
         "chunk_size": 1000000,
         "feature_chunksize": 1000,
         "use_preprocessor": True,
-        "test_mode": True,          
+        "test_mode": args.test_mode,
         "prefetch_factor": 2,
 
         # 모델 아키텍처
-        "categorical_embedding_dim": 32,
+        "categorical_embedding_dim": args.categorical_embedding_dim,
         "notice_dense_input_dim": 256,
         "company_dense_input_dim": 128,
         "tower_hidden_dims": [512, 256],
-        "final_embedding_dim": 128,
-        "dropout_rate": 0.1,
-        "temperature": 1.0,
+        "final_embedding_dim": args.final_embedding_dim,
+        "dropout_rate": args.dropout_rate,
+        "temperature": args.temperature,
         "loss_type": "cross_entropy",
         "label_smoothing": 0.0,
 
         # 학습 설정
-        "learning_rate": 1e-3,
-        "weight_decay": 1e-5,
-        "num_epochs": 1,
-        "warmup_ratio": 0.05,
-        "log_interval": 20,
+        "learning_rate": args.learning_rate,
+        "weight_decay": args.weight_decay,
+        "num_epochs": args.num_epochs,
+        "warmup_ratio": args.warmup_ratio,
+        "log_interval": args.log_interval,
 
         # 모델 저장/로딩
-        "output_dir": "output/models",
-        "save_best": True,
-        "save_final": True,
+        "output_dir": args.output_dir,
+        "save_best": args.save_best,
+        "save_final": args.save_final,
 
         # CUDA 최적화
-        "enable_tf32": True,
-        "enable_cudnn_benchmark": True,
-        "enable_torch_compile": False,  # 현재 주석처리됨
+        "enable_tf32": args.enable_tf32,
+        "enable_cudnn_benchmark": args.enable_cudnn_benchmark,
+        "enable_torch_compile": args.enable_torch_compile,
         "compile_mode": "reduce-overhead",
 
         # 시스템 설정
@@ -274,7 +322,22 @@ def main():
     print("\n=== 학습 시작 (GPU 최적화) ===")
     num_epochs = config["num_epochs"]
     best_val_loss = float('inf')
-    output_dir = Path(config["output_dir"])
+
+    # Timestamp 기반 output 디렉토리 생성
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = Path(config["output_dir"]) / timestamp
+    output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"모델 저장 경로: {output_dir}")
+
+    # 학습 설정 저장 (JSON 형식)
+    import json
+    config_save = config.copy()
+    config_save["timestamp"] = timestamp
+    config_save["total_params"] = total_params
+    config_save["trainable_params"] = trainable_params
+    with open(output_dir / "config.json", "w", encoding="utf-8") as f:
+        json.dump(config_save, f, indent=2, ensure_ascii=False)
+    print(f"학습 설정 저장: {output_dir / 'config.json'}")
 
     for epoch in range(num_epochs):
         print(f"\nEpoch {epoch+1}/{num_epochs}")
