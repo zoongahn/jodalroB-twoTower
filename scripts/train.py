@@ -85,7 +85,7 @@ def parse_args():
     parser.add_argument("--test_split", type=float, default=0.2, help="테스트 데이터 비율")
     parser.add_argument("--shuffle_seed", type=int, default=42, help="랜덤 시드")
     parser.add_argument("--pair_limit", type=lambda x: None if x.lower() == 'none' else int(x),
-                        default=1000000, help="학습에 사용할 최대 페어 수 (none이면 전체 데이터 사용)")
+                        default=None, help="학습에 사용할 최대 페어 수 (none이면 전체 데이터 사용)")
 
     # DataLoader 설정
     parser.add_argument("--num_workers", type=int, default=0, help="DataLoader 워커 수")
@@ -106,6 +106,7 @@ def parse_args():
     parser.add_argument("--num_epochs", type=int, default=1, help="학습 에포크 수")
     parser.add_argument("--warmup_ratio", type=float, default=0.05, help="Warmup 비율")
     parser.add_argument("--log_interval", type=int, default=20, help="로그 출력 간격")
+    parser.add_argument("--resume", type=str, default=None, help="이어학습할 체크포인트 경로 (예: output/models/checkpoint_epoch_1.pt)")
 
     # 모델 저장/로딩
     parser.add_argument("--output_dir", type=str, default="output/models", help="모델 저장 디렉토리")
@@ -161,6 +162,7 @@ def main():
         # 학습 설정
         "learning_rate": args.learning_rate,
         "weight_decay": args.weight_decay,
+        "resume": args.resume,
         "num_epochs": args.num_epochs,
         "warmup_ratio": args.warmup_ratio,
         "log_interval": args.log_interval,
@@ -322,24 +324,45 @@ def main():
     print("\n=== 학습 시작 (GPU 최적화) ===")
     num_epochs = config["num_epochs"]
     best_val_loss = float('inf')
+    start_epoch = 0
 
-    # Timestamp 기반 output 디렉토리 생성
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = Path(config["output_dir"]) / timestamp
-    output_dir.mkdir(parents=True, exist_ok=True)
-    print(f"모델 저장 경로: {output_dir}")
+    # Resume 체크
+    if config.get("resume"):
+        checkpoint_path = Path(config["resume"])
+        if checkpoint_path.exists():
+            print(f"\n🔄 이어학습 모드: {checkpoint_path}")
+            start_epoch, best_val_loss = load_checkpoint(train_task, optimizer, checkpoint_path)
+            # Output 디렉토리는 체크포인트의 부모 디렉토리 사용
+            output_dir = checkpoint_path.parent
+            print(f"기존 모델 저장 경로 사용: {output_dir}")
+        else:
+            print(f"⚠️ 체크포인트를 찾을 수 없습니다: {checkpoint_path}")
+            print("새로운 학습을 시작합니다.")
+            start_epoch = 0
+            best_val_loss = float('inf')
+            # 새 디렉토리 생성
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_dir = Path(config["output_dir"]) / timestamp
+            output_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        # 새 학습 시작
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_dir = Path(config["output_dir"]) / timestamp
+        output_dir.mkdir(parents=True, exist_ok=True)
+        print(f"모델 저장 경로: {output_dir}")
 
-    # 학습 설정 저장 (JSON 형식)
-    import json
-    config_save = config.copy()
-    config_save["timestamp"] = timestamp
-    config_save["total_params"] = total_params
-    config_save["trainable_params"] = trainable_params
-    with open(output_dir / "config.json", "w", encoding="utf-8") as f:
-        json.dump(config_save, f, indent=2, ensure_ascii=False)
-    print(f"학습 설정 저장: {output_dir / 'config.json'}")
+    # 학습 설정 저장 (JSON 형식) - 새 학습인 경우에만
+    if not config.get("resume"):
+        import json
+        config_save = config.copy()
+        config_save["timestamp"] = timestamp
+        config_save["total_params"] = total_params
+        config_save["trainable_params"] = trainable_params
+        with open(output_dir / "config.json", "w", encoding="utf-8") as f:
+            json.dump(config_save, f, indent=2, ensure_ascii=False)
+        print(f"학습 설정 저장: {output_dir / 'config.json'}")
 
-    for epoch in range(num_epochs):
+    for epoch in range(start_epoch, num_epochs):
         print(f"\nEpoch {epoch+1}/{num_epochs}")
         
         # 학습
@@ -352,19 +375,19 @@ def main():
             train_loader,
             desc="Training",
             unit="batch",
-            position=0,  # 0번째 줄 (윗줄)
+            position=0,
             bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {rate_fmt}',
-            ncols=100,
+            dynamic_ncols=True,
             mininterval=0.5,
-            leave=False  # 완료 후 진행바 제거
+            leave=False
         )
 
         # 상세 정보용 tqdm (아랫줄)
         info_bar = tqdm(
             total=0,
-            position=1,  # 1번째 줄 (아랫줄)
+            position=1,
             bar_format='{desc}',
-            ncols=100,
+            dynamic_ncols=True,
             leave=False
         )
         
@@ -438,7 +461,7 @@ def main():
                     unit="batch",
                     position=0,
                     bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {rate_fmt}',
-                    ncols=100,
+                    dynamic_ncols=True,
                     mininterval=0.5,
                     leave=False
                 )
@@ -447,7 +470,7 @@ def main():
                     total=0,
                     position=1,
                     bar_format='{desc}',
-                    ncols=100,
+                    dynamic_ncols=True,
                     leave=False
                 )
 
