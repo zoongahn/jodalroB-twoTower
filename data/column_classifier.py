@@ -92,7 +92,12 @@ def classify_columns(
     col_is_cat = _find_col(df, COL_MAP["is_categorical"])
 
     # 1) 테이블 필터
-    df_tbl = df[df[col_table].astype(str).str.strip() == str(table_name).strip()].copy()
+    # _preprocessed 접미사가 있으면 제거해서 원본 테이블명으로 매칭
+    base_table_name = str(table_name).strip()
+    if base_table_name.endswith('_preprocessed'):
+        base_table_name = base_table_name[:-len('_preprocessed')]
+
+    df_tbl = df[df[col_table].astype(str).str.strip() == base_table_name].copy()
 
     # 2) 사용 여부=Y
     use_mask = df_tbl[col_use].apply(_normalize_yes)

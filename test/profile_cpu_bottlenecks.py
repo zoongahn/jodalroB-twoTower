@@ -18,7 +18,7 @@ sys.path.insert(0, str(project_root))
 
 from src.profiling.cpu_profiler import CPUBottleneckProfiler, profile_dataloader_performance, profile_collate_function_separately
 from data.database_connector import DatabaseConnector
-from src.torchrec_preprocess.schema import build_torchrec_schema_from_meta
+from preprocess.schema import build_torchrec_schema_from_meta
 from src.towers.pairs.unified_bid_data_loader import create_unified_bid_dataloaders
 
 

@@ -6,7 +6,7 @@ notice-company 페어가 올바르게 정렬되었는지 확인
 
 import torch
 from data.database_connector import DatabaseConnector
-from src.torchrec_preprocess.schema import build_torchrec_schema_from_meta
+from preprocess.schema import build_torchrec_schema_from_meta
 from src.towers.pairs.unified_bid_data_loader import create_unified_bid_dataloaders
 from src.towers.two_tower_train_task import create_two_tower_train_task
 

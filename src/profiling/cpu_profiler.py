@@ -368,7 +368,7 @@ def run_comprehensive_profiling():
 
     # 기본 설정 (train.py와 동일)
     from data.database_connector import DatabaseConnector
-    from src.torchrec_preprocess.schema import build_torchrec_schema_from_meta
+    from preprocess.schema import build_torchrec_schema_from_meta
     from src.towers.pairs.unified_bid_data_loader import create_unified_bid_dataloaders
 
     db = DatabaseConnector()

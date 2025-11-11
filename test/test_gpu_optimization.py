@@ -17,7 +17,7 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 from data.database_connector import DatabaseConnector
-from src.torchrec_preprocess.schema import build_torchrec_schema_from_meta
+from preprocess.schema import build_torchrec_schema_from_meta
 from src.towers.pairs.unified_bid_data_loader import (
     create_unified_bid_dataloaders,
     create_collate_fn,

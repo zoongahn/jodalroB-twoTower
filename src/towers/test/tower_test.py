@@ -4,8 +4,8 @@ from sqlalchemy import Engine
 from typing import Dict, Any
 
 # 필요한 모듈들 import
-from src.torchrec_preprocess.schema import build_torchrec_schema_from_meta
-from src.torchrec_preprocess.torchrec_inputs import get_tower_input
+from preprocess.schema import build_torchrec_schema_from_meta
+from preprocess.torchrec_inputs import get_tower_input
 from data.database_connector import DatabaseConnector
 
 # 타워 모듈들 import

@@ -1,0 +1,892 @@
+"""
+Pair Loader V2 - EmbeddingBagCollection용 최적화 DataLoader
+
+V1의 모든 기능 + GPU 최적화:
+- ID-only DataLoader (H2D 최소화)
+- Streaming 모드 (대용량 데이터)
+- Shuffle (epoch별 셔플)
+- 선택적 feature 로딩
+- GPU gather (train loop에서)
+"""
+
+import torch
+import pandas as pd
+import numpy as np
+from torch.utils.data import Dataset, DataLoader, IterableDataset
+from typing import Dict, List, Tuple, Optional
+from sqlalchemy.engine import Engine
+from pathlib import Path
+
+from preprocess.schema import TorchRecSchema
+from preprocess.feature_store import build_feature_store, build_feature_store_with_condition
+from preprocess.feature_preprocessor import FeaturePreprocessor
+
+
+class PairDatasetV2(Dataset):
+    """
+    Pair Dataset V2 - 비스트리밍 모드 (전체 메모리 로드)
+
+    ID-only 반환 → GPU gather는 train loop에서
+    """
+
+    def __init__(
+        self,
+        pairs_df: pd.DataFrame,
+        notice_store: Dict,
+        company_store: Dict,
+        schema: TorchRecSchema,
+        shuffle: bool = False,
+        shuffle_seed: int = 42,
+    ):
+        """
+        Args:
+            pairs_df: pair 데이터 (bidntceno, bidntceord, bizno)
+            notice_store: Notice feature store (preprocessed)
+            company_store: Company feature store (preprocessed)
+            schema: TorchRec 스키마
+            shuffle: Epoch별 셔플 여부
+            shuffle_seed: 셔플 시드
+        """
+        self.schema = schema
+        self.notice_store = notice_store
+        self.company_store = company_store
+        self.shuffle = shuffle
+        self.shuffle_seed = shuffle_seed
+        self.current_epoch = 0
+
+        # ID 매핑 생성
+        self._build_id_mappings(notice_store, company_store)
+
+        # Pairs를 텐서로 변환 (한 번만)
+        self._build_pair_tensors(pairs_df)
+
+        print(f"✅ PairDatasetV2 초기화 완료:")
+        print(f"   - Pairs: {len(self.notice_idx_tensor):,}개")
+        print(f"   - Notice features: {len(self.notice_id_to_idx):,}개")
+        print(f"   - Company features: {len(self.company_id_to_idx):,}개")
+        print(f"   - Shuffle: {shuffle}")
+
+    def _build_id_mappings(self, notice_store: Dict, company_store: Dict):
+        """ID → 인덱스 매핑"""
+        # Notice: tuple of str
+        notice_ids = notice_store['ids']
+        self.notice_id_to_idx = {
+            (str(a), str(b)): idx for idx, (a, b) in enumerate(notice_ids)
+        }
+
+        # Company: str
+        company_ids = company_store['ids']
+        if company_ids:
+            if isinstance(company_ids[0], (tuple, list)):
+                self.company_id_to_idx = {
+                    str(id_tuple[0]): idx for idx, id_tuple in enumerate(company_ids)
+                }
+            else:
+                self.company_id_to_idx = {
+                    str(company_id): idx for idx, company_id in enumerate(company_ids)
+                }
+
+    def _build_pair_tensors(self, pairs_df: pd.DataFrame):
+        """Pairs를 텐서로 변환"""
+        notice_indices = []
+        company_indices = []
+
+        for _, row in pairs_df.iterrows():
+            # 타입 정규화
+            notice_key = (str(row['bidntceno']), str(row['bidntceord']))
+            company_key = str(row['bizno'])
+
+            # 매핑
+            try:
+                notice_idx = self.notice_id_to_idx[notice_key]
+                company_idx = self.company_id_to_idx[company_key]
+
+                notice_indices.append(notice_idx)
+                company_indices.append(company_idx)
+
+            except KeyError as e:
+                # print(f"⚠️  매핑 실패 (스킵): {e}")
+                continue
+
+        # LongTensor로 변환 (CPU)
+        self.notice_idx_tensor = torch.as_tensor(notice_indices, dtype=torch.long)
+        self.company_idx_tensor = torch.as_tensor(company_indices, dtype=torch.long)
+
+        # Shuffle 인덱스 초기화
+        self.indices = torch.arange(len(self.notice_idx_tensor))
+
+    def set_epoch(self, epoch: int):
+        """Epoch 설정 (shuffle용)"""
+        self.current_epoch = epoch
+        if self.shuffle:
+            # Epoch별로 다른 순서
+            generator = torch.Generator()
+            generator.manual_seed(self.shuffle_seed + epoch)
+            self.indices = torch.randperm(len(self.notice_idx_tensor), generator=generator)
+
+    def __len__(self) -> int:
+        return len(self.notice_idx_tensor)
+
+    def __getitem__(self, idx: int) -> Tuple[int, int]:
+        """
+        텐서 스칼라 반환 → default_collate가 자동으로 [B] 텐서 생성
+
+        Returns:
+            (notice_idx, company_idx): 각각 Python int (텐서 스칼라)
+        """
+        # Shuffle 적용
+        actual_idx = self.indices[idx].item()
+
+        return (
+            self.notice_idx_tensor[actual_idx].item(),
+            self.company_idx_tensor[actual_idx].item()
+        )
+
+
+class StreamingPairDatasetV2(IterableDataset):
+    """
+    Streaming Pair Dataset V2 - chunk 단위 로딩
+
+    대용량 데이터셋용 (메모리 제약)
+    """
+
+    def __init__(
+        self,
+        db_engine: Engine,
+        schema: TorchRecSchema,
+        notice_store: Dict,
+        company_store: Dict,
+        chunk_size: int = 10000,
+        offset: int = 0,
+        limit: Optional[int] = None,
+        shuffle: bool = False,
+        shuffle_seed: int = 42,
+    ):
+        """
+        Args:
+            db_engine: DB 엔진
+            schema: TorchRec 스키마
+            notice_store: Notice feature store (preprocessed)
+            company_store: Company feature store (preprocessed)
+            chunk_size: Chunk 크기
+            offset: 시작 offset
+            limit: 총 pair 제한
+            shuffle: Chunk 내 셔플 여부
+            shuffle_seed: 셔플 시드
+        """
+        self.db_engine = db_engine
+        self.schema = schema
+        self.notice_store = notice_store
+        self.company_store = company_store
+        self.chunk_size = chunk_size
+        self.offset = offset
+        self.limit = limit
+        self.shuffle = shuffle
+        self.shuffle_seed = shuffle_seed
+        self.current_epoch = 0
+
+        # ID 매핑
+        self._build_id_mappings(notice_store, company_store)
+
+        print(f"✅ StreamingPairDatasetV2 초기화 완료:")
+        print(f"   - Chunk size: {chunk_size:,}")
+        print(f"   - Offset: {offset:,}")
+        print(f"   - Limit: {limit if limit else '전체'}")
+        print(f"   - Shuffle: {shuffle}")
+
+    def _build_id_mappings(self, notice_store: Dict, company_store: Dict):
+        """ID → 인덱스 매핑"""
+        notice_ids = notice_store['ids']
+        self.notice_id_to_idx = {
+            (str(a), str(b)): idx for idx, (a, b) in enumerate(notice_ids)
+        }
+
+        company_ids = company_store['ids']
+        if company_ids:
+            if isinstance(company_ids[0], (tuple, list)):
+                self.company_id_to_idx = {
+                    str(id_tuple[0]): idx for idx, id_tuple in enumerate(company_ids)
+                }
+            else:
+                self.company_id_to_idx = {
+                    str(company_id): idx for idx, company_id in enumerate(company_ids)
+                }
+
+    def set_epoch(self, epoch: int):
+        """Epoch 설정 (shuffle seed 변경용)"""
+        self.current_epoch = epoch
+
+    def __iter__(self):
+        """Iterator: chunk 단위로 pair 로딩"""
+        current_offset = self.offset
+        total_yielded = 0
+
+        while True:
+            # Limit 체크
+            if self.limit and total_yielded >= self.limit:
+                break
+
+            # Chunk 크기 조정 (limit 고려)
+            actual_chunk_size = self.chunk_size
+            if self.limit:
+                remaining = self.limit - total_yielded
+                actual_chunk_size = min(self.chunk_size, remaining)
+
+            # DB에서 chunk 로딩
+            query = f"""
+            SELECT bidntceno, bidntceord, bizno
+            FROM {self.schema.pair.table}
+            ORDER BY id
+            LIMIT {actual_chunk_size} OFFSET {current_offset}
+            """
+
+            chunk_df = pd.read_sql(query, self.db_engine)
+
+            if len(chunk_df) == 0:
+                break
+
+            # Chunk를 텐서로 변환
+            notice_indices = []
+            company_indices = []
+
+            for _, row in chunk_df.iterrows():
+                notice_key = (str(row['bidntceno']), str(row['bidntceord']))
+                company_key = str(row['bizno'])
+
+                try:
+                    notice_idx = self.notice_id_to_idx[notice_key]
+                    company_idx = self.company_id_to_idx[company_key]
+
+                    notice_indices.append(notice_idx)
+                    company_indices.append(company_idx)
+
+                except KeyError:
+                    continue
+
+            # Shuffle (chunk 내부)
+            if self.shuffle:
+                indices = list(range(len(notice_indices)))
+                rng = np.random.RandomState(self.shuffle_seed + self.current_epoch + current_offset)
+                rng.shuffle(indices)
+                notice_indices = [notice_indices[i] for i in indices]
+                company_indices = [company_indices[i] for i in indices]
+
+            # Yield
+            for notice_idx, company_idx in zip(notice_indices, company_indices):
+                yield (notice_idx, company_idx)
+                total_yielded += 1
+
+            # 다음 chunk
+            current_offset += actual_chunk_size
+
+            # Chunk가 작으면 종료
+            if len(chunk_df) < actual_chunk_size:
+                break
+
+
+def create_pair_dataloaders(
+    db_engine: Engine,
+    schema: TorchRecSchema,
+    batch_size: int = 256,
+    pair_limit: Optional[int] = None,
+    test_split: float = 0.1,
+    shuffle: bool = False,
+    shuffle_seed: int = 42,
+    num_workers: int = 0,
+    pin_memory: bool = True,
+    prefetch_factor: Optional[int] = None,
+    persistent_workers: bool = False,
+    streaming: bool = False,
+    chunk_size: int = 10000,
+    feature_chunksize: int = 10000,
+    feature_limit: Optional[int] = None,
+    device: torch.device = None,
+    test_mode: bool = False,
+) -> Tuple[DataLoader, DataLoader, Dict]:
+    """
+    Pair DataLoader V2 생성 (EmbeddingBagCollection용)
+
+    V1의 모든 기능 포함:
+    - streaming: chunk 단위 로딩
+    - shuffle: epoch별 셔플
+    - num_workers, pin_memory, prefetch_factor
+    - 선택적 feature 로딩
+    - test_mode: pair_limit만큼만 feature 로딩
+
+    Args:
+        db_engine: DB 엔진
+        schema: TorchRec 스키마
+        batch_size: 배치 크기
+        pair_limit: pair 개수 제한
+        test_split: 테스트 비율
+        shuffle: 셔플 여부
+        shuffle_seed: 셔플 시드
+        num_workers: DataLoader workers (streaming=False면 0 권장)
+        pin_memory: Pin memory 사용
+        prefetch_factor: Prefetch factor
+        persistent_workers: Persistent workers
+        streaming: 스트리밍 모드
+        chunk_size: 스트리밍 chunk 크기
+        feature_chunksize: Feature 로딩 chunk 크기
+        feature_limit: Feature 로딩 제한
+        device: GPU device
+        test_mode: True면 pair_limit에 해당하는 feature만 로딩
+
+    Returns:
+        (train_loader, test_loader, metadata)
+    """
+    if device is None:
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+    # Test mode: pair_limit에 해당하는 feature만 선택적으로 로딩
+    if test_mode and pair_limit:
+        print(f"🧪 Test Mode 활성화: pair_limit={pair_limit}, streaming={streaming}")
+        return _create_test_mode_dataloaders(
+            db_engine=db_engine,
+            schema=schema,
+            batch_size=batch_size,
+            pair_limit=pair_limit,
+            test_split=test_split,
+            shuffle=shuffle,
+            shuffle_seed=shuffle_seed,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            prefetch_factor=prefetch_factor,
+            persistent_workers=persistent_workers,
+            streaming=streaming,
+            chunk_size=chunk_size,
+            device=device,
+        )
+
+    print("\n" + "="*80)
+    print("PairDataLoaderV2 생성 (EmbeddingBagCollection용)")
+    print("="*80)
+    print(f"모드: {'Streaming' if streaming else '전체 로드'}")
+    print(f"Shuffle: {shuffle}")
+    print(f"Batch size: {batch_size}")
+    print(f"Pair limit: {pair_limit if pair_limit else '전체'}")
+
+    # ========================================================================
+    # 1. Feature Store 로딩 (전체 또는 선택적)
+    # ========================================================================
+    print("\n1. Feature Store 로딩...")
+
+    if pair_limit and not streaming:
+        # 선택적 로딩: pair_limit만큼만 로드 후 필요한 feature만
+        print(f"   선택적 Feature 로딩 모드 (pair_limit={pair_limit:,})")
+
+        # 먼저 pair 로딩
+        pair_query = f"""
+        SELECT bidntceno, bidntceord, bizno
+        FROM {schema.pair.table}
+        ORDER BY id
+        LIMIT {pair_limit}
+        """
+        pairs_df = pd.read_sql(pair_query, db_engine)
+        print(f"   로딩된 pair 수: {len(pairs_df):,}")
+
+        # 필요한 ID만 추출
+        notice_ids = set(zip(pairs_df['bidntceno'], pairs_df['bidntceord']))
+        company_ids = set(pairs_df['bizno'].astype(str))
+
+        print(f"   Notice ID 수: {len(notice_ids):,}")
+        print(f"   Company ID 수: {len(company_ids):,}")
+
+        # SQL WHERE 조건 생성
+        notice_conditions = []
+        for bidntceno, bidntceord in list(notice_ids):
+            notice_conditions.append(
+                f"(bidntceno='{bidntceno}' AND bidntceord::integer={int(bidntceord)})"
+            )
+        notice_where = " OR ".join(notice_conditions)
+
+        company_quoted_ids = [f"'{cid}'" for cid in company_ids]
+        company_where = "bizno IN (" + ",".join(company_quoted_ids) + ")"
+
+        # Feature store 로딩
+        notice_store = build_feature_store_with_condition(
+            db_engine, schema.notice, where_condition=notice_where, show_progress=True
+        )
+        company_store = build_feature_store_with_condition(
+            db_engine, schema.company, where_condition=company_where, show_progress=True
+        )
+
+        print(f"   Notice features: {len(notice_store['ids']):,}")
+        print(f"   Company features: {len(company_store['ids']):,}")
+
+    else:
+        # 전체 로딩
+        print(f"   전체 Feature 로딩")
+        notice_store = build_feature_store(
+            db_engine, schema.notice,
+            chunksize=feature_chunksize,
+            limit=feature_limit,
+            show_progress=True
+        )
+        company_store = build_feature_store(
+            db_engine, schema.company,
+            chunksize=feature_chunksize,
+            limit=feature_limit,
+            show_progress=True
+        )
+
+        print(f"   Notice features: {len(notice_store['ids']):,}")
+        print(f"   Company features: {len(company_store['ids']):,}")
+
+        # Pair 로딩 (선택적 로딩이 아니면 여기서)
+        if not streaming:
+            pair_query = f"""
+            SELECT bidntceno, bidntceord, bizno
+            FROM {schema.pair.table}
+            ORDER BY id
+            """
+            if pair_limit:
+                pair_query += f" LIMIT {pair_limit}"
+
+            pairs_df = pd.read_sql(pair_query, db_engine)
+            print(f"   로딩된 pair 수: {len(pairs_df):,}")
+
+    # ========================================================================
+    # 2. Feature 전처리 (projection)
+    # ========================================================================
+    print("\n2. Feature 전처리 (projection)...")
+    preprocessor = FeaturePreprocessor(
+        schema=schema,
+        device=device,
+        num_proj_dim=128,
+        text_proj_dim=128,
+        batch_size=1024
+    )
+
+    preprocessed_stores = preprocessor.preprocess_stores(notice_store, company_store)
+
+    print(f"   Notice dense_projected: {preprocessed_stores['notice']['dense_projected'].shape}")
+    print(f"   Company dense_projected: {preprocessed_stores['company']['dense_projected'].shape}")
+
+    # ========================================================================
+    # 3. Dataset 생성
+    # ========================================================================
+    print("\n3. Dataset 생성...")
+
+    if streaming:
+        # Streaming 모드
+        print(f"   Streaming 모드 (chunk_size={chunk_size:,})")
+
+        # Train dataset
+        train_limit = None
+        if pair_limit:
+            train_limit = int(pair_limit * (1 - test_split))
+
+        train_dataset = StreamingPairDatasetV2(
+            db_engine=db_engine,
+            schema=schema,
+            notice_store=preprocessed_stores['notice'],
+            company_store=preprocessed_stores['company'],
+            chunk_size=chunk_size,
+            offset=0,
+            limit=train_limit,
+            shuffle=shuffle,
+            shuffle_seed=shuffle_seed,
+        )
+
+        # Test dataset
+        test_dataset = None
+        if test_split > 0:
+            test_offset = train_limit if train_limit else 0
+            test_limit = None
+            if pair_limit:
+                test_limit = int(pair_limit * test_split)
+
+            test_dataset = StreamingPairDatasetV2(
+                db_engine=db_engine,
+                schema=schema,
+                notice_store=preprocessed_stores['notice'],
+                company_store=preprocessed_stores['company'],
+                chunk_size=chunk_size,
+                offset=test_offset,
+                limit=test_limit,
+                shuffle=False,
+                shuffle_seed=shuffle_seed,
+            )
+
+    else:
+        # 비스트리밍 모드 (전체 메모리)
+        print(f"   비스트리밍 모드 (전체 메모리 로드)")
+
+        # Train/Test 분할
+        if test_split > 0:
+            from sklearn.model_selection import train_test_split
+            train_pairs, test_pairs = train_test_split(
+                pairs_df, test_size=test_split, random_state=shuffle_seed
+            )
+        else:
+            train_pairs = pairs_df
+            test_pairs = None
+
+        print(f"   Train pairs: {len(train_pairs):,}")
+        if test_pairs is not None:
+            print(f"   Test pairs: {len(test_pairs):,}")
+
+        # Train dataset
+        train_dataset = PairDatasetV2(
+            pairs_df=train_pairs,
+            notice_store=preprocessed_stores['notice'],
+            company_store=preprocessed_stores['company'],
+            schema=schema,
+            shuffle=shuffle,
+            shuffle_seed=shuffle_seed,
+        )
+
+        # Test dataset
+        test_dataset = None
+        if test_pairs is not None:
+            test_dataset = PairDatasetV2(
+                pairs_df=test_pairs,
+                notice_store=preprocessed_stores['notice'],
+                company_store=preprocessed_stores['company'],
+                schema=schema,
+                shuffle=False,
+                shuffle_seed=shuffle_seed,
+            )
+
+    # ========================================================================
+    # 4. DataLoader 생성
+    # ========================================================================
+    print("\n4. DataLoader 생성...")
+
+    # Prefetch factor 설정
+    if prefetch_factor is None:
+        prefetch_factor = 2 if num_workers > 0 else None
+
+    train_loader = DataLoader(
+        dataset=train_dataset,
+        batch_size=batch_size,
+        shuffle=False if streaming else False,  # Dataset 내부에서 shuffle 처리
+        collate_fn=None,  # default_collate
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        prefetch_factor=prefetch_factor,
+        persistent_workers=persistent_workers and num_workers > 0,
+    )
+
+    test_loader = None
+    if test_dataset is not None:
+        test_loader = DataLoader(
+            dataset=test_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            collate_fn=None,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            prefetch_factor=prefetch_factor,
+            persistent_workers=persistent_workers and num_workers > 0,
+        )
+
+    # ========================================================================
+    # 5. Metadata 반환
+    # ========================================================================
+    metadata = {
+        "notice_store": preprocessed_stores['notice'],
+        "company_store": preprocessed_stores['company'],
+        "schema": schema,
+    }
+
+    print(f"\n✅ DataLoader 생성 완료:")
+    print(f"   Train batches: {len(train_loader) if not streaming else 'streaming'}")
+    if test_loader is not None:
+        print(f"   Test batches: {len(test_loader) if not streaming else 'streaming'}")
+    print("="*80 + "\n")
+
+    return train_loader, test_loader, metadata
+
+
+if __name__ == "__main__":
+    """테스트"""
+    from data.database_connector import DatabaseConnector
+    from preprocess.schema import build_torchrec_schema_from_meta
+
+    print("=== PairLoaderV2 테스트 ===\n")
+
+    db = DatabaseConnector()
+    engine = db.engine
+
+    config = {
+        "pair_notice_id_cols": ["bidntceno", "bidntceord"],
+        "pair_company_id_cols": ["bizno"],
+        "metadata_path": "meta/metadata.csv"
+    }
+    schema = build_torchrec_schema_from_meta(**config)
+
+    # 비스트리밍 테스트
+    print("\n[테스트 1] 비스트리밍 모드")
+    train_loader, test_loader, metadata = create_pair_dataloaders_v2(
+        db_engine=engine,
+        schema=schema,
+        batch_size=64,
+        pair_limit=1000,
+        test_split=0.2,
+        shuffle=True,
+        streaming=False,
+        num_workers=0,
+        pin_memory=True,
+    )
+
+    print("\n배치 샘플:")
+    for batch_idx, batch in enumerate(train_loader):
+        notice_idx, company_idx = batch
+        print(f"  Batch {batch_idx}: notice_idx={notice_idx.shape}, company_idx={company_idx.shape}")
+        print(f"    notice_idx 예시: {notice_idx[:5]}")
+        print(f"    company_idx 예시: {company_idx[:5]}")
+        if batch_idx >= 2:
+            break
+
+    # Streaming 테스트
+    print("\n\n[테스트 2] 스트리밍 모드")
+    train_loader_stream, test_loader_stream, metadata_stream = create_pair_dataloaders_v2(
+        db_engine=engine,
+        schema=schema,
+        batch_size=64,
+        pair_limit=1000,
+        test_split=0.2,
+        shuffle=True,
+        streaming=True,
+        chunk_size=200,
+        num_workers=0,
+        pin_memory=True,
+    )
+
+    print("\n배치 샘플:")
+    for batch_idx, batch in enumerate(train_loader_stream):
+        notice_idx, company_idx = batch
+        print(f"  Batch {batch_idx}: notice_idx={notice_idx.shape}, company_idx={company_idx.shape}")
+        if batch_idx >= 2:
+            break
+
+    print("\n✅ 모든 테스트 통과!")
+
+
+def _create_test_mode_dataloaders(
+    db_engine: Engine,
+    schema: TorchRecSchema,
+    batch_size: int,
+    pair_limit: int,
+    test_split: float,
+    shuffle: bool,
+    shuffle_seed: int,
+    num_workers: int,
+    pin_memory: bool,
+    prefetch_factor: Optional[int],
+    persistent_workers: bool,
+    streaming: bool,
+    chunk_size: int,
+    device: torch.device,
+) -> Tuple[DataLoader, DataLoader, Dict]:
+    """
+    Test Mode용 DataLoader 생성 - pair_limit에 해당하는 feature만 선택적 로딩
+
+    핵심: pair → ID 추출 → 해당 ID feature만 로딩 → 100% 매칭 보장
+    """
+    print("\n" + "="*80)
+    print("🧪 Test Mode DataLoader 생성 (선택적 feature 로딩)")
+    print("="*80)
+    print(f"Pair limit: {pair_limit:,}")
+    print(f"Streaming: {streaming}")
+    print(f"Chunk size: {chunk_size if streaming else 'N/A'}")
+
+    # ========================================================================
+    # 1. 제한된 pair 로딩
+    # ========================================================================
+    print("\n1. 제한된 pair 로딩...")
+    pair_query = f"""
+    SELECT bidntceno, bidntceord, bizno
+    FROM {schema.pair.table}
+    ORDER BY id
+    LIMIT {pair_limit}
+    """
+    pairs_df = pd.read_sql(pair_query, db_engine)
+    print(f"   로딩된 pair 수: {len(pairs_df):,}")
+
+    # ========================================================================
+    # 2. 실제 pair ID 추출
+    # ========================================================================
+    print("\n2. 필요한 ID 추출...")
+    notice_ids = set(zip(pairs_df['bidntceno'], pairs_df['bidntceord']))
+    company_ids = set(pairs_df['bizno'].astype(str))
+
+    print(f"   Notice ID 수: {len(notice_ids):,}")
+    print(f"   Company ID 수: {len(company_ids):,}")
+
+    # ========================================================================
+    # 3. 선택적 feature 로딩 (SQL WHERE 조건)
+    # ========================================================================
+    print("\n3. 선택적 Feature 로딩...")
+
+    # Notice WHERE 조건
+    notice_conditions = []
+    for bidntceno, bidntceord in list(notice_ids):
+        notice_conditions.append(
+            f"(bidntceno='{bidntceno}' AND bidntceord::integer={int(bidntceord)})"
+        )
+    notice_where = " OR ".join(notice_conditions)
+
+    # Company WHERE 조건
+    company_quoted_ids = [f"'{cid}'" for cid in company_ids]
+    company_where = "bizno IN (" + ",".join(company_quoted_ids) + ")"
+
+    # Feature store 로딩
+    notice_store = build_feature_store_with_condition(
+        db_engine, schema.notice, where_condition=notice_where, show_progress=True
+    )
+    company_store = build_feature_store_with_condition(
+        db_engine, schema.company, where_condition=company_where, show_progress=True
+    )
+
+    print(f"   Notice features: {len(notice_store['ids']):,}")
+    print(f"   Company features: {len(company_store['ids']):,}")
+
+    # ========================================================================
+    # 4. Feature 전처리 (projection)
+    # ========================================================================
+    print("\n4. Feature 전처리...")
+    preprocessor = FeaturePreprocessor(
+        schema=schema,
+        device=device,
+        num_proj_dim=128,
+        text_proj_dim=128,
+        batch_size=1024
+    )
+
+    preprocessed_stores = preprocessor.preprocess_stores(notice_store, company_store)
+    print(f"   Notice dense_projected: {preprocessed_stores['notice']['dense_projected'].shape}")
+    print(f"   Company dense_projected: {preprocessed_stores['company']['dense_projected'].shape}")
+
+    # ========================================================================
+    # 5. Dataset 생성
+    # ========================================================================
+    print("\n5. Dataset 생성...")
+
+    if streaming:
+        # Streaming 모드
+        print(f"   Streaming 모드 (chunk_size={chunk_size:,})")
+
+        # Train dataset
+        train_limit = int(pair_limit * (1 - test_split)) if test_split > 0 else pair_limit
+
+        train_dataset = StreamingPairDatasetV2(
+            db_engine=db_engine,
+            schema=schema,
+            notice_store=preprocessed_stores['notice'],
+            company_store=preprocessed_stores['company'],
+            chunk_size=chunk_size,
+            offset=0,
+            limit=train_limit,
+            shuffle=shuffle,
+            shuffle_seed=shuffle_seed,
+        )
+
+        # Test dataset
+        test_dataset = None
+        if test_split > 0:
+            test_offset = train_limit
+            test_limit = int(pair_limit * test_split)
+
+            test_dataset = StreamingPairDatasetV2(
+                db_engine=db_engine,
+                schema=schema,
+                notice_store=preprocessed_stores['notice'],
+                company_store=preprocessed_stores['company'],
+                chunk_size=chunk_size,
+                offset=test_offset,
+                limit=test_limit,
+                shuffle=False,
+                shuffle_seed=shuffle_seed,
+            )
+
+    else:
+        # 비스트리밍 모드
+        print(f"   비스트리밍 모드")
+
+        # Train/Test 분할
+        if test_split > 0:
+            from sklearn.model_selection import train_test_split
+            train_pairs, test_pairs = train_test_split(
+                pairs_df, test_size=test_split, random_state=shuffle_seed
+            )
+        else:
+            train_pairs = pairs_df
+            test_pairs = None
+
+        print(f"   Train pairs: {len(train_pairs):,}")
+        if test_pairs is not None:
+            print(f"   Test pairs: {len(test_pairs):,}")
+
+        # Train dataset
+        train_dataset = PairDatasetV2(
+            pairs_df=train_pairs,
+            notice_store=preprocessed_stores['notice'],
+            company_store=preprocessed_stores['company'],
+            schema=schema,
+            shuffle=shuffle,
+            shuffle_seed=shuffle_seed,
+        )
+
+        # Test dataset
+        test_dataset = None
+        if test_pairs is not None:
+            test_dataset = PairDatasetV2(
+                pairs_df=test_pairs,
+                notice_store=preprocessed_stores['notice'],
+                company_store=preprocessed_stores['company'],
+                schema=schema,
+                shuffle=False,
+                shuffle_seed=shuffle_seed,
+            )
+
+    # ========================================================================
+    # 6. DataLoader 생성
+    # ========================================================================
+    print("\n6. DataLoader 생성...")
+
+    if prefetch_factor is None:
+        prefetch_factor = 2 if num_workers > 0 else None
+
+    train_loader = DataLoader(
+        dataset=train_dataset,
+        batch_size=batch_size,
+        shuffle=False,  # Dataset 내부에서 shuffle 처리
+        collate_fn=None,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        prefetch_factor=prefetch_factor,
+        persistent_workers=persistent_workers and num_workers > 0,
+    )
+
+    test_loader = None
+    if test_dataset is not None:
+        test_loader = DataLoader(
+            dataset=test_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            collate_fn=None,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            prefetch_factor=prefetch_factor,
+            persistent_workers=persistent_workers and num_workers > 0,
+        )
+
+    # ========================================================================
+    # 7. Metadata 반환
+    # ========================================================================
+    metadata = {
+        "notice_store": preprocessed_stores['notice'],
+        "company_store": preprocessed_stores['company'],
+        "schema": schema,
+    }
+
+    print(f"\n✅ Test Mode DataLoader 생성 완료:")
+    print(f"   Train batches: {len(train_loader) if not streaming else 'streaming'}")
+    if test_loader is not None:
+        print(f"   Test batches: {len(test_loader) if not streaming else 'streaming'}")
+    print("="*80 + "\n")
+
+    return train_loader, test_loader, metadata

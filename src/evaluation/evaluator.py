@@ -1,6 +1,7 @@
 import torch
 from typing import Dict, List, Any
 from tqdm import tqdm
+import numpy as np
 
 
 class TwoTowerEvaluator:
@@ -88,6 +89,42 @@ class TwoTowerEvaluator:
         recall_10 = self.compute_recall_at_k(similarity_matrix, k=10).item()
         mrr = self.compute_mrr(similarity_matrix).item()
         
+        # Multi-label 지표 계산 (Top-5를 positive로 간주)
+        # y_true: 각 공고의 정답 업체 인덱스 (대각선) -> one-hot encoding
+        # y_pred: Top-5 예측을 positive로
+        y_true = torch.zeros(batch_size, batch_size, device=similarity_matrix.device)
+        y_true[torch.arange(batch_size), torch.arange(batch_size)] = 1.0
+        
+        # Top-5 예측
+        top_5_indices = torch.topk(similarity_matrix, k=min(5, batch_size), dim=1).indices
+        y_pred = torch.zeros(batch_size, batch_size, device=similarity_matrix.device)
+        for i in range(batch_size):
+            y_pred[i, top_5_indices[i]] = 1.0
+        
+        # 지표 계산
+        y_true_np = y_true.cpu().numpy()
+        y_pred_np = y_pred.cpu().numpy()
+        
+        # Hamming Loss: 평균 오분류 비율
+        hamming_loss = np.mean(y_true_np != y_pred_np)
+        
+        # Jaccard Index (IoU): 교집합 / 합집합
+        intersection = np.sum(y_true_np * y_pred_np, axis=1)
+        union = np.sum((y_true_np + y_pred_np) > 0, axis=1)
+        jaccard_index = np.mean(intersection / (union + 1e-10))
+        
+        # Subset Accuracy: 완전히 일치하는 비율
+        subset_accuracy = np.mean(np.all(y_true_np == y_pred_np, axis=1))
+        
+        # Precision, Recall, F1 Score
+        true_positives = np.sum(y_true_np * y_pred_np)
+        predicted_positives = np.sum(y_pred_np)
+        actual_positives = np.sum(y_true_np)
+        
+        precision = true_positives / (predicted_positives + 1e-10)
+        recall = true_positives / (actual_positives + 1e-10)
+        f1_score = 2 * precision * recall / (precision + recall + 1e-10)
+        
         # 랜덤 기준선
         random_accuracy = 1.0 / batch_size
         random_recall_5 = min(5.0 / batch_size, 1.0)
@@ -106,6 +143,14 @@ class TwoTowerEvaluator:
             'recall@10': recall_10,
             'mrr': mrr,
             'batch_size': batch_size,
+            
+            # Multi-label 지표
+            'hamming_loss': float(hamming_loss),
+            'jaccard_index': float(jaccard_index),
+            'subset_accuracy': float(subset_accuracy),
+            'precision': float(precision),
+            'recall': float(recall),
+            'f1_score': float(f1_score),
             
             # 랜덤 기준선
             'random_accuracy': random_accuracy,

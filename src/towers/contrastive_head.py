@@ -68,8 +68,8 @@ def diag_consistency_report(q: torch.Tensor, k: torch.Tensor, log_prefix: str = 
     # Z-score gap 계산
     gap = (diag.mean() - offdiag.mean()) / (offdiag.std(unbiased=False) + 1e-6)
 
-    print(f"{log_prefix} B={B} diag_mean={diag.mean().item():.4f} "
-          f"off_mean={offdiag.mean().item():.4f} off_std={offdiag.std(unbiased=False).item():.4f} "
-          f"z_gap={gap:.3f} min={sim.min().item():.4f} max={sim.max().item():.4f}")
+    # print(f"{log_prefix} B={B} diag_mean={diag.mean().item():.4f} "  # 로깅 제거
+    #       f"off_mean={offdiag.mean().item():.4f} off_std={offdiag.std(unbiased=False).item():.4f} "
+    #       f"z_gap={gap:.3f} min={sim.min().item():.4f} max={sim.max().item():.4f}")
 
     return gap

@@ -6,11 +6,11 @@ import torch
 from torchrec import KeyedJaggedTensor
 from sqlalchemy.engine import Engine
 
-from src.torchrec_preprocess.feature_projector import FeatureProjector
+from preprocess.feature_projector import FeatureProjector
 
 
-from src.torchrec_preprocess.schema import build_torchrec_schema_from_meta, SideSchema
-from src.torchrec_preprocess.feature_store import build_feature_store
+from preprocess.schema import build_torchrec_schema_from_meta, SideSchema
+from preprocess.feature_store import build_feature_store
 from data.database_connector import DatabaseConnector
 
 

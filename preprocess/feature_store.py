@@ -4,7 +4,7 @@ from typing import Dict, List, Tuple, Optional
 from sqlalchemy import text
 import torch
 
-from src.torchrec_preprocess.schema import SideSchema
+from preprocess.schema import SideSchema
 
 class FeatureStore:
     def __init__(self, engine, side_schema: SideSchema, chunksize: int = 200_000, limit: int = None, where_condition: str = None):
@@ -25,14 +25,20 @@ class FeatureStore:
 
     def build(self, show_progress: bool = True):
         # 테이블명 처리: schema.table_preprocessed 형식으로 변환
-        table_parts = self.sch.table.split('.')
-        if len(table_parts) == 2:
-            # schema.table 형식
-            schema_name, table_name = table_parts
-            full_table = f"{schema_name}.{table_name}_preprocessed"
+        # 단, 이미 _preprocessed가 붙어있으면 추가하지 않음
+        if self.sch.table.endswith('_preprocessed'):
+            # 이미 _preprocessed가 있으면 그대로 사용
+            full_table = self.sch.table
         else:
-            # table만 있는 경우
-            full_table = f"{self.sch.table}_preprocessed"
+            # _preprocessed가 없으면 추가
+            table_parts = self.sch.table.split('.')
+            if len(table_parts) == 2:
+                # schema.table 형식
+                schema_name, table_name = table_parts
+                full_table = f"{schema_name}.{table_name}_preprocessed"
+            else:
+                # table만 있는 경우
+                full_table = f"{self.sch.table}_preprocessed"
 
         # 먼저 총 행 수 계산 (진행도 표시용)
         if show_progress:
@@ -46,7 +52,30 @@ class FeatureStore:
                     total_rows = cx.execute(text(count_sql)).scalar()
 
             from tqdm import tqdm
-            pbar = tqdm(total=total_rows, desc=f"Loading {self.sch.table}", unit="rows")
+            import sys
+            # 테이블명 축약 (step1.notice -> notice)
+            table_display = self.sch.table.split('.')[-1] if '.' in self.sch.table else self.sch.table
+
+            # 터미널이 tty인지 확인
+            if sys.stdout.isatty():
+                pbar = tqdm(
+                    total=total_rows,
+                    desc=f"{table_display}",
+                    unit="rows",
+                    dynamic_ncols=True,
+                    leave=False,
+                    bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]'
+                )
+            else:
+                # 비-tty 환경 (redirect, pipe 등)에서는 ncols 고정
+                pbar = tqdm(
+                    total=total_rows,
+                    desc=f"{table_display}",
+                    unit="rows",
+                    ncols=120,
+                    leave=False,
+                    bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]'
+                )
 
         # 필요한 컬럼만 SELECT
         cols = self.sch.pk_cols + self.sch.numeric + self.sch.categorical
@@ -152,6 +181,7 @@ def process_text_embeddings_optimized(df, text_cols, vec_dims):
 
 
 def build_feature_store(engine, side_schema: SideSchema, chunksize: int = 200_000, limit: int = None, show_progress: bool = False):
+    print(f"  🔧 build_feature_store: chunksize={chunksize:,} (table={side_schema.table})")
     store = FeatureStore(engine, side_schema, chunksize, limit, where_condition=None)  # where_condition 추가
     store.build(show_progress)
     
@@ -194,7 +224,7 @@ def build_feature_store_with_condition(
 
 
 if __name__ == "__main__":
-    from src.torchrec_preprocess.schema import build_torchrec_schema_from_meta
+    from preprocess.schema import build_torchrec_schema_from_meta
     from data.database_connector import DatabaseConnector
 
     db = DatabaseConnector()

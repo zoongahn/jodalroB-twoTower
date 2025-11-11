@@ -7,9 +7,9 @@ import numpy as np
 from typing import Dict, Optional, Tuple
 from tqdm import tqdm
 
-from src.torchrec_preprocess.feature_store import build_feature_store
-from src.torchrec_preprocess.feature_projector import FeatureProjector
-from src.torchrec_preprocess.schema import TorchRecSchema, SideSchema
+from preprocess.feature_store import build_feature_store
+from preprocess.feature_projector import FeatureProjector
+from preprocess.schema import TorchRecSchema, SideSchema
 
 
 class FeaturePreprocessor:
@@ -69,13 +69,14 @@ class FeaturePreprocessor:
     ) -> Dict[str, Dict]:
         """
         전체 피처 전처리 파이프라인 실행
-        
+
         Returns:
             Dict[str, Dict]: {
                 'notice': preprocessed_notice_store,
                 'company': preprocessed_company_store
             }
         """
+        print(f"📊 FeaturePreprocessor.preprocess_all: feature_chunksize={feature_chunksize:,}")
         preprocessed_stores = {}
         
         # Notice 피처 처리
@@ -152,7 +153,8 @@ class FeaturePreprocessor:
         store: Dict,
         projector: FeatureProjector,
         tower_schema: SideSchema,
-        tower_name: str
+        tower_name: str,
+        show_progress: bool = True
     ) -> Dict:
         """
         Projection을 배치 단위로 적용하여 CPU에 저장
@@ -168,9 +170,13 @@ class FeaturePreprocessor:
         
         # 배치 단위로 처리
         with torch.no_grad():
-            for start_idx in tqdm(range(0, n_samples, self.batch_size), 
-                                 desc=f"Projecting {tower_name}", 
-                                 disable=not show_progress):
+            for start_idx in tqdm(
+                range(0, n_samples, self.batch_size),
+                desc=f"Projecting {tower_name}",
+                disable=not show_progress,
+                dynamic_ncols=True,
+                leave=False
+            ):
                 end_idx = min(start_idx + self.batch_size, n_samples)
                 
                 # 배치 슬라이싱
@@ -232,10 +238,52 @@ class FeaturePreprocessor:
         
         return result_store
     
+    def preprocess_stores(
+        self,
+        notice_store: Dict,
+        company_store: Dict
+    ) -> Dict[str, Dict]:
+        """
+        이미 로딩된 feature store를 전처리
+
+        Args:
+            notice_store: Raw notice feature store
+            company_store: Raw company feature store
+
+        Returns:
+            Dict[str, Dict]: {
+                'notice': preprocessed_notice_store,
+                'company': preprocessed_company_store
+            }
+        """
+        preprocessed_stores = {}
+
+        # Notice projection
+        print("  Notice projection 적용...")
+        notice_projected = self._apply_projection(
+            notice_store,
+            self.projectors['notice'],
+            self.schema.notice,
+            'notice'
+        )
+        preprocessed_stores['notice'] = notice_projected
+
+        # Company projection
+        print("  Company projection 적용...")
+        company_projected = self._apply_projection(
+            company_store,
+            self.projectors['company'],
+            self.schema.company,
+            'company'
+        )
+        preprocessed_stores['company'] = company_projected
+
+        return preprocessed_stores
+
     def build_id_mappings(self, stores: Dict[str, Dict]) -> Tuple[Dict, Dict]:
         """
         ID 매핑 딕셔너리 생성
-        
+
         Returns:
             (notice_id_to_idx, company_id_to_idx)
         """

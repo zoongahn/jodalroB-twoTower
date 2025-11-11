@@ -81,17 +81,17 @@ class TwoTowerTrainTask(nn.Module):
             notice_embeddings, company_embeddings = result
             logits = self.two_tower_model.contrastive_head(notice_embeddings, company_embeddings)
 
-        # 3) Positive pair 정합성 검증 (최초 2회만 - 디버깅용)
-        if not hasattr(self, '_pair_check_count'):
-            self._pair_check_count = 0
-
-        if self._pair_check_count < 2:
-            print(f"\n🔍 [Step {self._pair_check_count}] Positive Pair Alignment Check")
-            z_gap = diag_consistency_report(
-                notice_embeddings, company_embeddings,
-                log_prefix=f"[diag@step{self._pair_check_count}]"
-            )
-            self._pair_check_count += 1
+        # 3) Positive pair 정합성 검증 (로깅 제거)
+        # if not hasattr(self, '_pair_check_count'):
+        #     self._pair_check_count = 0
+        # 
+        # if self._pair_check_count < 2:
+        #     print(f"\n🔍 [Step {self._pair_check_count}] Positive Pair Alignment Check")
+        #     z_gap = diag_consistency_report(
+        #         notice_embeddings, company_embeddings,
+        #         log_prefix=f"[diag@step{self._pair_check_count}]"
+        #     )
+        #     self._pair_check_count += 1
 
         # 4) 손실 계산 (in-batch negative sampling)
         loss = self._compute_loss_with_logits(logits, batch_size)
@@ -299,9 +299,9 @@ def _verify_positive_pair_alignment(self, similarity_matrix: torch.Tensor):
     row_hit = (row_top1 == diag_idx).float().mean().item()  # notice → company
     col_hit = (col_top1 == diag_idx).float().mean().item()  # company → notice
 
-    print(f"🔍 [Positive Pair Alignment Check]")
-    print(f"   📊 Notice→Company Top-1 정확도: {row_hit:.3f}")
-    print(f"   📊 Company→Notice Top-1 정확도: {col_hit:.3f}")
+    # print(f"🔍 [Positive Pair Alignment Check]")  # 로깅 제거
+    # print(f"   📊 Notice→Company Top-1 정확도: {row_hit:.3f}")
+    # print(f"   📊 Company→Notice Top-1 정확도: {col_hit:.3f}")
 
     # 대각선 vs 최대값 분석
     diag_values = similarity_matrix.diag()

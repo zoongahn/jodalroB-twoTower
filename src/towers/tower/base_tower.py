@@ -1,88 +1,134 @@
+"""
+BaseTowerV2 - EmbeddingBagCollection 기반
+
+기존 BaseTower 대비 개선:
+- CatEmbed 사용 (GPU kernel 최적화)
+- Metadata 기반 자동 config 생성
+- FP16 연산 지원
+- stride=B 명시로 배치 차원 보장
+"""
+
 import torch
 import torch.nn as nn
 from typing import Dict, List, Optional
-from pathlib import Path
-from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
+from torchrec import KeyedJaggedTensor
+from torchrec.modules.embedding_configs import PoolingType
 
-# SafeCategoricalEmbedder 임포트 (경로는 실제 구조에 맞게 조정)
-from src.towers.cat_embed import CategoricalEmbedder
+from src.towers.cat_embed import CatEmbed
+from src.towers.embedding_config import (
+    create_notice_embedding_configs,
+    create_company_embedding_configs
+)
 
 
 class BaseTower(nn.Module):
     """
-    Two-Tower 모델의 기본 타워 클래스
+    BaseTower V2 - EmbeddingBagCollection 기반
+
+    기존 BaseTower와 인터페이스 호환성 유지하면서 성능 개선
     """
+
     def __init__(
         self,
-        categorical_keys: List[str],
+        table_name: str,
         metadata_path: str = "meta/metadata.csv",
-        table_name: str = "notice",
-        categorical_embedding_dim: int = 64,
+        categorical_embedding_dim: int = 32,
         dense_input_dim: int = 256,
         tower_hidden_dims: Optional[List[int]] = None,
         final_embedding_dim: int = 128,
         dropout_rate: float = 0.2,
-        device: Optional[torch.device] = "cuda:0",
+        pooling_mode: PoolingType = PoolingType.MEAN,
+        device: Optional[torch.device] = None,
+        use_fp16: bool = False,  # FP16 학습 지원
     ):
         """
-        Base Tower 모델
-        
         Args:
-            categorical_keys: 범주형 피처 키 리스트
-            metadata_path: 메타데이터 CSV 파일 경로
-            table_name: 테이블명 (notice 또는 company)
+            table_name: "notice" or "company"
+            metadata_path: metadata.csv 경로
             categorical_embedding_dim: 범주형 임베딩 차원
-            dense_input_dim: dense 입력 차원 (수치형+텍스트 결합 후)
-            tower_hidden_dims: MLP 히든 레이어 차원들
+            dense_input_dim: dense 입력 차원
+            tower_hidden_dims: MLP 히든 레이어 차원
             final_embedding_dim: 최종 출력 임베딩 차원
             dropout_rate: 드롭아웃 비율
-            device: 디바이스
+            pooling_mode: EmbeddingBag pooling 방식
+            device: GPU device (None이면 cuda:0)
+            use_fp16: True면 FP16 연산 (AMP와 함께 사용)
         """
         super().__init__()
-        
+
         if tower_hidden_dims is None:
             tower_hidden_dims = [256, 128]
-        
-        self.categorical_keys = categorical_keys
+
+        if device is None:
+            device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+        self.table_name = table_name
         self.device = device
-                
-        # 1) SafeCategoricalEmbedder 사용
-        self.categorical_embedder = CategoricalEmbedder(
-            keys=categorical_keys,
-            metadata_path=metadata_path,
-            table_name=table_name,
-            embedding_dim=categorical_embedding_dim,
-            device=str(self.device),
-        ).to(torch.device(self.device))
-        
-        # 2) Dense 프로젝션
-        self.dense_projection = nn.Linear(dense_input_dim, tower_hidden_dims[0])
-        
-        # 3) MLP 구성
+        self.use_fp16 = use_fp16
+
+        # 1) EmbeddingBagConfig 생성 (metadata 기반)
+        if table_name == "notice":
+            embedding_configs = create_notice_embedding_configs(
+                metadata_path=metadata_path,
+                embedding_dim=categorical_embedding_dim,
+                pooling_mode=pooling_mode,
+                add_unk_token=True
+            )
+        elif table_name == "company":
+            embedding_configs = create_company_embedding_configs(
+                metadata_path=metadata_path,
+                embedding_dim=categorical_embedding_dim,
+                pooling_mode=pooling_mode,
+                add_unk_token=True
+            )
+        else:
+            raise ValueError(f"Unknown table_name: {table_name}")
+
+        # 2) CatEmbed (EmbeddingBagCollection 기반)
+        self.categorical_embedder = CatEmbed(
+            embedding_configs=embedding_configs,
+            device=device
+        )
+
+        # Feature names 저장 (디버깅용)
+        self.categorical_keys = self.categorical_embedder.feature_names
+
+        # 3) Dense 프로젝션
+        self.dense_projection = nn.Linear(dense_input_dim, tower_hidden_dims[0]).to(device)
+
+        # 4) MLP 구성
+        categorical_total_dim = self.categorical_embedder.get_output_dim()
         self._build_mlp(
-            categorical_embedding_dim=categorical_embedding_dim,
+            categorical_total_dim=categorical_total_dim,
             tower_hidden_dims=tower_hidden_dims,
             final_embedding_dim=final_embedding_dim,
             dropout_rate=dropout_rate
         )
-        
-        self.to(torch.device("cuda:0"))
-    
+
+        # 모델 전체를 device로 이동
+        self.to(device)
+
+        print(f"\n✅ {table_name.capitalize()} TowerV2 초기화 완료:")
+        print(f"   - 범주형 피처 수: {len(self.categorical_keys)}")
+        print(f"   - 범주형 출력 차원: {categorical_total_dim}")
+        print(f"   - Dense 입력 차원: {dense_input_dim}")
+        print(f"   - 최종 출력 차원: {final_embedding_dim}")
+        print(f"   - 디바이스: {device}")
+        print(f"   - FP16 모드: {use_fp16}")
+
     def _build_mlp(
-        self, 
-        categorical_embedding_dim: int, 
+        self,
+        categorical_total_dim: int,
         tower_hidden_dims: List[int],
         final_embedding_dim: int,
         dropout_rate: float
     ):
         """MLP 레이어 구성"""
-        # 결합된 피처 차원 계산
-        categorical_total_dim = len(self.categorical_keys) * categorical_embedding_dim
         combined_input_dim = tower_hidden_dims[0] + categorical_total_dim
-        
+
         mlp_layers = []
         input_dim = combined_input_dim
-        
+
         # 히든 레이어들
         for hidden_dim in tower_hidden_dims[1:]:
             mlp_layers.extend([
@@ -92,56 +138,47 @@ class BaseTower(nn.Module):
                 nn.Dropout(dropout_rate),
             ])
             input_dim = hidden_dim
-        
+
         # 최종 출력 레이어
         mlp_layers.append(nn.Linear(input_dim, final_embedding_dim))
-        
+
         self.mlp = nn.Sequential(*mlp_layers)
-        
+
     def forward(self, tower_input: Dict[str, torch.Tensor]) -> torch.Tensor:
         """
+        Forward pass
+
         Args:
             tower_input: {
-                "dense": torch.Tensor [B, dense_dim],
-                "kjt": KeyedJaggedTensor,
-                "text": Dict[str, torch.Tensor] (optional)
+                "dense": Tensor [B, dense_dim] (FP16 or FP32),
+                "kjt": KeyedJaggedTensor (GPU)
             }
-        
+
         Returns:
-            torch.Tensor [B, final_embedding_dim]: 최종 타워 임베딩
+            Tensor [B, final_embedding_dim]: L2 normalized embedding
         """
-        
-        # 모든 파라미터와 버퍼를 cuda:0으로 이동
-        for name, param in self.named_parameters():
-            if param.device != torch.device("cuda:0"):
-                print(f"WARNING: param {name} is on {param.device}")
-        
-        # 버퍼도 이동 (BatchNorm의 running_mean, running_var 등)
-        for name, buffer in self.named_buffers():
-            if buffer.device != torch.device("cuda:0"):
-                print(f"WARNING: buffer {name} is on {buffer.device}")
-                
-        # 어떤 파라미터가 requires_grad=False인지 확인
-        for name, param in self.named_parameters():
-            if not param.requires_grad:
-                print(f"{name}: requires_grad={param.requires_grad}")
-        
-        dense = tower_input["dense"].to(self.device)
-        kjt = tower_input["kjt"].to(self.device)
-        
-        # 1) Dense 피처 프로젝션
+        dense = tower_input["dense"]
+        kjt = tower_input["kjt"]
+
+        # 디바이스 이동 (필요 시)
+        if dense.device != self.device:
+            dense = dense.to(self.device)
+        if hasattr(kjt, 'to') and kjt.device != self.device:
+            kjt = kjt.to(self.device)
+
+        # 1) Dense 프로젝션
         dense_projected = self.dense_projection(dense)
-        
-        # 2) 범주형 임베딩
-        categorical_combined = self.categorical_embedder(kjt, return_dict=False)
-        
+
+        # 2) 범주형 임베딩 (EmbeddingBagCollection)
+        categorical_combined = self.categorical_embedder(kjt)  # [B, cat_total_dim]
+
         # 3) 결합
         combined_features = torch.cat([dense_projected, categorical_combined], dim=1)
-        
-        # 4) MLP를 통과하여 최종 임베딩 생성
+
+        # 4) MLP
         tower_embedding = self.mlp(combined_features)
-        
-        # L2 정규화
+
+        # 5) L2 정규화
         tower_embedding = torch.nn.functional.normalize(tower_embedding, p=2, dim=1)
-        
+
         return tower_embedding

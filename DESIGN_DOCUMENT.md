@@ -71,9 +71,9 @@
 config:
     layout: fixed
     look: neo
-    theme: redux
+    theme: default
     themeVariables:
-        fontSize: 20px
+        fontSize: 18px
 ---
 flowchart TB
     subgraph DATABASE["💾 Database Layer"]
