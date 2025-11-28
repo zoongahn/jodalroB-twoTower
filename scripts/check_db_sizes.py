@@ -10,7 +10,7 @@ Usage:
 
 import argparse
 import pandas as pd
-from data.database_connector import DatabaseConnector
+from database.database_connector import DatabaseConnector
 
 
 def format_bytes(bytes_value):

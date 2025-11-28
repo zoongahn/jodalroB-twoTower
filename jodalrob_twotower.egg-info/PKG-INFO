@@ -1,0 +1,38 @@
+Metadata-Version: 2.4
+Name: jodalrob-twotower
+Version: 1.0.0
+Summary: Two-Tower recommendation system with runtime package for jodalroB
+Author: jodalroB Team
+License: MIT
+Keywords: recommendation,two-tower,deep-learning,torchrec
+Classifier: Development Status :: 4 - Beta
+Classifier: Intended Audience :: Developers
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: torch>=2.0.0
+Requires-Dist: numpy>=1.24.0
+Requires-Dist: pandas>=2.0.0
+Requires-Dist: psycopg>=3.1.0
+Requires-Dist: sqlalchemy>=2.0.0
+Requires-Dist: python-dotenv>=1.0.0
+Requires-Dist: tqdm>=4.65.0
+Requires-Dist: faiss-cpu>=1.7.4
+Requires-Dist: scikit-learn>=1.3.0
+Provides-Extra: torchrec
+Requires-Dist: torchrec>=0.7.0; extra == "torchrec"
+Requires-Dist: fbgemm-gpu; extra == "torchrec"
+Provides-Extra: training
+Requires-Dist: tensorboard>=2.14.0; extra == "training"
+Requires-Dist: matplotlib>=3.7.0; extra == "training"
+Requires-Dist: seaborn>=0.12.0; extra == "training"
+Requires-Dist: polars>=0.20.0; extra == "training"
+Provides-Extra: dev
+Requires-Dist: pytest>=7.4.0; extra == "dev"
+Requires-Dist: pytest-cov>=4.1.0; extra == "dev"
+Requires-Dist: black>=23.7.0; extra == "dev"
+Requires-Dist: flake8>=6.1.0; extra == "dev"
+Requires-Dist: mypy>=1.5.0; extra == "dev"

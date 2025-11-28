@@ -209,8 +209,11 @@ venv/
 # End of https://www.toptal.com/developers/gitignore/api/pycharm,visualstudiocode,macos,windows
 
 
+.claude/
 output/
 outputs/
 models/
-parquet/
+data/
 __pycache__/
+docs/최연준이사님_프로젝트/
+sim_cut/

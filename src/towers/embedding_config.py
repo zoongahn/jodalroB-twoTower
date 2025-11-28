@@ -7,7 +7,7 @@ metadata.csv 기반으로 EmbeddingBagCollection용 설정 자동 생성
 from typing import List, Dict, Optional
 from torchrec import EmbeddingBagConfig
 from torchrec.modules.embedding_configs import PoolingType
-from preprocess.metadata_parser import MetadataParser
+from preprocess.torchrec.metadata_parser import MetadataParser
 
 
 def create_embedding_bag_configs(

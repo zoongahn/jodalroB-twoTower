@@ -16,9 +16,9 @@ from tqdm import tqdm
 import json
 
 from sqlalchemy.engine import Engine
-from preprocess.schema import TorchRecSchema
-from preprocess.feature_store import build_feature_store
-from preprocess.feature_preprocessor import FeaturePreprocessor
+from preprocess.torchrec.schema import TorchRecSchema
+from preprocess.torchrec.feature_store import build_feature_store
+from preprocess.torchrec.feature_preprocessor import FeaturePreprocessor
 from src.towers.two_tower_train_task import create_two_tower_train_task
 
 
@@ -142,11 +142,11 @@ class EmbeddingExtractor:
 
                 # 배치 데이터 준비
                 batch_dense = torch.from_numpy(dense_projected[start_idx:end_idx]).float().to(self.device)
-                batch_cat = torch.from_numpy(categorical[start_idx:end_idx]).long()
+                batch_cat = torch.from_numpy(categorical[start_idx:end_idx]).long().to(self.device)
 
                 # KJT 생성
-                from src.towers.pairs.unified_bid_data_loader import _build_batch_kjt
-                batch_kjt = _build_batch_kjt(batch_cat, self.schema.notice.categorical).to(self.device)
+                from src.towers.kjt_utils import create_kjt_from_batch_gpu
+                batch_kjt = create_kjt_from_batch_gpu(batch_cat, self.schema.notice.categorical, self.device)
 
                 # Notice 입력 구성
                 notice_input = {
@@ -207,11 +207,11 @@ class EmbeddingExtractor:
 
                 # 배치 데이터 준비
                 batch_dense = torch.from_numpy(dense_projected[start_idx:end_idx]).float().to(self.device)
-                batch_cat = torch.from_numpy(categorical[start_idx:end_idx]).long()
+                batch_cat = torch.from_numpy(categorical[start_idx:end_idx]).long().to(self.device)
 
                 # KJT 생성
-                from src.towers.pairs.unified_bid_data_loader import _build_batch_kjt
-                batch_kjt = _build_batch_kjt(batch_cat, self.schema.company.categorical).to(self.device)
+                from src.towers.kjt_utils import create_kjt_from_batch_gpu
+                batch_kjt = create_kjt_from_batch_gpu(batch_cat, self.schema.company.categorical, self.device)
 
                 # Company 입력 구성
                 company_input = {

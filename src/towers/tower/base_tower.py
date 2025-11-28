@@ -116,6 +116,38 @@ class BaseTower(nn.Module):
         print(f"   - 디바이스: {device}")
         print(f"   - FP16 모드: {use_fp16}")
 
+    def _check_tensor(self, name: str, x: torch.Tensor):
+        """🔍 NaN/Inf 체크 헬퍼"""
+        if x is None:
+            return
+
+        t = x.detach()
+        if not torch.is_floating_point(t):
+            return
+
+        has_nan = torch.isnan(t).any()
+        has_inf = torch.isinf(t).any()
+
+        if has_nan or has_inf:
+            # 가능하면 finite 값 기준으로 대략적인 통계도 같이 로그
+            try:
+                finite_mask = torch.isfinite(t)
+                if finite_mask.any():
+                    finite_vals = t[finite_mask]
+                    t_min = float(finite_vals.min())
+                    t_max = float(finite_vals.max())
+                    t_mean = float(finite_vals.mean())
+                    stats = f"min={t_min}, max={t_max}, mean={t_mean}"
+                else:
+                    stats = "no finite values"
+            except Exception:
+                stats = "stats_unavailable"
+
+            raise RuntimeError(
+                f"[{self.__class__.__name__}] NaN/Inf detected in '{name}'. "
+                f"(has_nan={bool(has_nan)}, has_inf={bool(has_inf)}, {stats})"
+            )
+
     def _build_mlp(
         self,
         categorical_total_dim: int,
@@ -134,7 +166,7 @@ class BaseTower(nn.Module):
             mlp_layers.extend([
                 nn.Linear(input_dim, hidden_dim),
                 nn.ReLU(),
-                nn.BatchNorm1d(hidden_dim),
+                nn.LayerNorm(hidden_dim),  # 🔁 BatchNorm1d → LayerNorm (NaN 문제 방지)
                 nn.Dropout(dropout_rate),
             ])
             input_dim = hidden_dim
@@ -166,19 +198,27 @@ class BaseTower(nn.Module):
         if hasattr(kjt, 'to') and kjt.device != self.device:
             kjt = kjt.to(self.device)
 
+        # 🔍 입력 dense 체크
+        self._check_tensor("input_dense", dense)
+
         # 1) Dense 프로젝션
         dense_projected = self.dense_projection(dense)
+        self._check_tensor("dense_projected", dense_projected)
 
         # 2) 범주형 임베딩 (EmbeddingBagCollection)
         categorical_combined = self.categorical_embedder(kjt)  # [B, cat_total_dim]
+        self._check_tensor("categorical_combined", categorical_combined)
 
         # 3) 결합
         combined_features = torch.cat([dense_projected, categorical_combined], dim=1)
+        self._check_tensor("combined_features", combined_features)
 
         # 4) MLP
         tower_embedding = self.mlp(combined_features)
+        self._check_tensor("tower_embedding_before_norm", tower_embedding)
 
         # 5) L2 정규화
         tower_embedding = torch.nn.functional.normalize(tower_embedding, p=2, dim=1)
+        self._check_tensor("tower_embedding_after_norm", tower_embedding)
 
         return tower_embedding

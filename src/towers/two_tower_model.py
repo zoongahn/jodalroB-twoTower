@@ -9,12 +9,13 @@ import torch.nn as nn
 from typing import Dict, List, Optional
 from torchrec.modules.embedding_configs import PoolingType
 
-from src.towers.tower_v2 import NoticeTowerV2, CompanyTowerV2
+from src.towers.tower.notice_tower import NoticeTower
+from src.towers.tower.company_tower import CompanyTower
 
 
-class TwoTowerModelV2(nn.Module):
+class TwoTowerModel(nn.Module):
     """
-    Two-Tower Model V2 - EmbeddingBagCollection 기반
+    Two-Tower Model - EmbeddingBagCollection 기반
 
     기존 TwoTowerModel과 인터페이스 호환성 유지
     """
@@ -51,7 +52,7 @@ class TwoTowerModelV2(nn.Module):
         self.device = device
 
         # Notice Tower
-        self.notice_tower = NoticeTowerV2(
+        self.notice_tower = NoticeTower(
             metadata_path=metadata_path,
             categorical_embedding_dim=categorical_embedding_dim,
             dense_input_dim=dense_input_dim,
@@ -64,7 +65,7 @@ class TwoTowerModelV2(nn.Module):
         )
 
         # Company Tower
-        self.company_tower = CompanyTowerV2(
+        self.company_tower = CompanyTower(
             metadata_path=metadata_path,
             categorical_embedding_dim=categorical_embedding_dim,
             dense_input_dim=dense_input_dim,
@@ -77,7 +78,7 @@ class TwoTowerModelV2(nn.Module):
         )
 
         print(f"\n{'='*80}")
-        print(f"TwoTowerModelV2 초기화 완료 (EmbeddingBagCollection 기반)")
+        print(f"TwoTowerModel 초기화 완료 (EmbeddingBagCollection 기반)")
         print(f"{'='*80}")
 
     def forward(
@@ -117,13 +118,13 @@ class TwoTowerModelV2(nn.Module):
 
 
 if __name__ == "__main__":
-    print("=== TwoTowerModelV2 테스트 ===\n")
+    print("=== TwoTowerModel 테스트 ===\n")
 
     # 1. 모델 생성
     print("1. 모델 생성 중...")
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-    model = TwoTowerModelV2(
+    model = TwoTowerModel(
         metadata_path="meta/metadata.csv",
         categorical_embedding_dim=32,
         dense_input_dim=256,
@@ -200,4 +201,4 @@ if __name__ == "__main__":
     print(f"   총 파라미터: {total_params:,}")
     print(f"   학습 가능 파라미터: {trainable_params:,}")
 
-    print("\n✅ TwoTowerModelV2 테스트 완료!")
+    print("\n✅ TwoTowerModel 테스트 완료!")

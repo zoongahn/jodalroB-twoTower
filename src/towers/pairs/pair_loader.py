@@ -17,9 +17,9 @@ from typing import Dict, List, Tuple, Optional
 from sqlalchemy.engine import Engine
 from pathlib import Path
 
-from preprocess.schema import TorchRecSchema
-from preprocess.feature_store import build_feature_store, build_feature_store_with_condition
-from preprocess.feature_preprocessor import FeaturePreprocessor
+from preprocess.torchrec.schema import TorchRecSchema
+from preprocess.torchrec.feature_store import build_feature_store, build_feature_store_with_condition, load_feature_store_from_parquet
+from preprocess.torchrec.feature_preprocessor import FeaturePreprocessor
 
 
 class PairDatasetV2(Dataset):
@@ -87,30 +87,68 @@ class PairDatasetV2(Dataset):
                 }
 
     def _build_pair_tensors(self, pairs_df: pd.DataFrame):
-        """Pairs를 텐서로 변환"""
+        """Pairs를 텐서로 변환 (벡터화 최적화)"""
+        from tqdm import tqdm
+
+        print(f"   Pair 텐서 변환 중 ({len(pairs_df):,} pairs)...")
+
+        # Category dtype 처리
+        bidntceno_values = pairs_df['bidntceno'].astype(str).values
+        bidntceord_values = pairs_df['bidntceord'].astype(str).values
+        bizno_values = pairs_df['bizno'].astype(str).values
+
+        # 청크 단위로 처리 (메모리 효율적)
+        chunk_size = 1_000_000  # 100만 개씩
+        total_pairs = len(pairs_df)
+
         notice_indices = []
         company_indices = []
+        skipped = 0
 
-        for _, row in pairs_df.iterrows():
-            # 타입 정규화
-            notice_key = (str(row['bidntceno']), str(row['bidntceord']))
-            company_key = str(row['bizno'])
+        with tqdm(total=total_pairs, desc="   Mapping", unit="pairs", leave=False) as pbar:
+            for start_idx in range(0, total_pairs, chunk_size):
+                end_idx = min(start_idx + chunk_size, total_pairs)
 
-            # 매핑
-            try:
-                notice_idx = self.notice_id_to_idx[notice_key]
-                company_idx = self.company_id_to_idx[company_key]
+                # 청크 처리
+                chunk_notice_indices = []
+                chunk_company_indices = []
 
-                notice_indices.append(notice_idx)
-                company_indices.append(company_idx)
+                for i in range(start_idx, end_idx):
+                    notice_key = (bidntceno_values[i], bidntceord_values[i])
+                    company_key = bizno_values[i]
 
-            except KeyError as e:
-                # print(f"⚠️  매핑 실패 (스킵): {e}")
-                continue
+                    # 매핑
+                    notice_idx = self.notice_id_to_idx.get(notice_key)
+                    company_idx = self.company_id_to_idx.get(company_key)
+
+                    if notice_idx is not None and company_idx is not None:
+                        chunk_notice_indices.append(notice_idx)
+                        chunk_company_indices.append(company_idx)
+                    else:
+                        skipped += 1
+                        if skipped <= 5:
+                            missing = notice_key if notice_idx is None else company_key
+                            print(f"⚠️ Pair 매핑 실패 (스킵): {missing}")
+
+                notice_indices.extend(chunk_notice_indices)
+                company_indices.extend(chunk_company_indices)
+
+                pbar.update(end_idx - start_idx)
+
+        # 매칭률 출력
+        match_rate = len(notice_indices) / len(pairs_df) * 100 if len(pairs_df) > 0 else 0
+        print(f"   📊 Pair 매칭률: {len(notice_indices):,}/{len(pairs_df):,} ({match_rate:.1f}%)")
+        if skipped > 0:
+            print(f"   ⚠️ 스킵된 pair: {skipped:,}개")
 
         # LongTensor로 변환 (CPU)
         self.notice_idx_tensor = torch.as_tensor(notice_indices, dtype=torch.long)
         self.company_idx_tensor = torch.as_tensor(company_indices, dtype=torch.long)
+
+        # 메모리 해제
+        del notice_indices, company_indices
+        import gc
+        gc.collect()
 
         # Shuffle 인덱스 초기화
         self.indices = torch.arange(len(self.notice_idx_tensor))
@@ -302,6 +340,8 @@ def create_pair_dataloaders(
     feature_limit: Optional[int] = None,
     device: torch.device = None,
     test_mode: bool = False,
+    use_parquet: bool = False,
+    parquet_dir: str = "data/parquet",
 ) -> Tuple[DataLoader, DataLoader, Dict]:
     """
     Pair DataLoader V2 생성 (EmbeddingBagCollection용)
@@ -312,6 +352,7 @@ def create_pair_dataloaders(
     - num_workers, pin_memory, prefetch_factor
     - 선택적 feature 로딩
     - test_mode: pair_limit만큼만 feature 로딩
+    - use_parquet: Parquet 파일로부터 로딩
 
     Args:
         db_engine: DB 엔진
@@ -331,6 +372,8 @@ def create_pair_dataloaders(
         feature_limit: Feature 로딩 제한
         device: GPU device
         test_mode: True면 pair_limit에 해당하는 feature만 로딩
+        use_parquet: True면 DB 대신 Parquet 파일 사용
+        parquet_dir: Parquet 파일 디렉토리
 
     Returns:
         (train_loader, test_loader, metadata)
@@ -362,6 +405,7 @@ def create_pair_dataloaders(
     print("PairDataLoaderV2 생성 (EmbeddingBagCollection용)")
     print("="*80)
     print(f"모드: {'Streaming' if streaming else '전체 로드'}")
+    print(f"데이터 소스: {'Parquet' if use_parquet else 'Database'}")
     print(f"Shuffle: {shuffle}")
     print(f"Batch size: {batch_size}")
     print(f"Pair limit: {pair_limit if pair_limit else '전체'}")
@@ -371,7 +415,106 @@ def create_pair_dataloaders(
     # ========================================================================
     print("\n1. Feature Store 로딩...")
 
-    if pair_limit and not streaming:
+    # 메모리 모니터링 시작
+    import psutil
+    import os as os_module
+    import gc
+    process = psutil.Process(os_module.getpid())
+
+    def get_memory_gb():
+        return process.memory_info().rss / 1024**3
+
+    mem_start = get_memory_gb()
+    print(f"   시작 메모리: {mem_start:.2f} GB")
+
+    if use_parquet:
+        # Parquet에서 로딩
+        print(f"   Parquet 파일에서 로딩: {parquet_dir}")
+        parquet_path = Path(parquet_dir)
+
+        # Notice store (청크 단위)
+        print(f"\n   [1/3] Notice 피처 로딩...")
+        notice_store = load_feature_store_from_parquet(
+            parquet_path / "notice.parquet",
+            schema.notice,
+            show_progress=True,
+            use_chunked=True,
+            chunksize=100_000
+        )
+        mem_after_notice = get_memory_gb()
+        print(f"   ✓ Notice features: {len(notice_store['ids']):,}")
+        print(f"   메모리: {mem_after_notice:.2f} GB (+{mem_after_notice - mem_start:.2f} GB)")
+
+        # Company store (청크 단위)
+        print(f"\n   [2/3] Company 피처 로딩...")
+        company_store = load_feature_store_from_parquet(
+            parquet_path / "company.parquet",
+            schema.company,
+            show_progress=True,
+            use_chunked=True,
+            chunksize=50_000
+        )
+        mem_after_company = get_memory_gb()
+        print(f"   ✓ Company features: {len(company_store['ids']):,}")
+        print(f"   메모리: {mem_after_company:.2f} GB (+{mem_after_company - mem_after_notice:.2f} GB)")
+
+        # Pair 로딩 (청크 단위)
+        if not streaming:
+            print(f"\n   [3/3] Pairs 데이터 로딩...")
+            import pyarrow.parquet as pq
+            from tqdm import tqdm
+
+            parquet_file = pq.ParquetFile(parquet_path / "pairs.parquet")
+            total_rows = parquet_file.metadata.num_rows
+
+            # pair_limit 적용
+            if pair_limit and pair_limit < total_rows:
+                total_rows = pair_limit
+
+            pairs_chunks = []
+            loaded_rows = 0
+
+            with tqdm(total=total_rows, desc="   Loading", unit="rows", leave=False) as pbar:
+                for batch in parquet_file.iter_batches(batch_size=1_000_000):
+                    chunk = batch.to_pandas()
+
+                    # pair_limit 체크
+                    if pair_limit and loaded_rows + len(chunk) > pair_limit:
+                        chunk = chunk.head(pair_limit - loaded_rows)
+
+                    # 메모리 최적화: categorical 타입으로 변환
+                    # 주의: bidntceord는 '000' 같은 leading zero를 유지해야 하므로 category로 변환
+                    chunk['bidntceno'] = chunk['bidntceno'].astype('category')
+                    chunk['bidntceord'] = chunk['bidntceord'].astype('category')
+                    chunk['bizno'] = chunk['bizno'].astype('category')
+
+                    pairs_chunks.append(chunk)
+                    loaded_rows += len(chunk)
+                    pbar.update(len(chunk))
+
+                    del chunk
+
+                    # pair_limit 도달 시 중단
+                    if pair_limit and loaded_rows >= pair_limit:
+                        break
+
+            # 청크 병합
+            pairs_df = pd.concat(pairs_chunks, ignore_index=True)
+            del pairs_chunks
+            gc.collect()
+
+            mem_after_pairs = get_memory_gb()
+            pairs_mem = pairs_df.memory_usage(deep=True).sum() / 1024**3
+            print(f"   ✓ 로딩된 pair 수: {len(pairs_df):,}")
+            print(f"   Pairs 메모리: {pairs_mem:.2f} GB")
+            print(f"   메모리: {mem_after_pairs:.2f} GB (+{mem_after_pairs - mem_after_company:.2f} GB)")
+
+            print(f"\n   총 메모리 사용량: {mem_after_pairs:.2f} GB (증가: +{mem_after_pairs - mem_start:.2f} GB)")
+        else:
+            print(f"   ⚠️ Streaming 모드는 Parquet에서 아직 지원되지 않습니다.")
+            raise NotImplementedError("Streaming mode with Parquet is not yet supported")
+
+    elif pair_limit and not streaming:
         # 선택적 로딩: pair_limit만큼만 로드 후 필요한 feature만
         print(f"   선택적 Feature 로딩 모드 (pair_limit={pair_limit:,})")
 
@@ -443,8 +586,25 @@ def create_pair_dataloaders(
             if pair_limit:
                 pair_query += f" LIMIT {pair_limit}"
 
-            pairs_df = pd.read_sql(pair_query, db_engine)
-            print(f"   로딩된 pair 수: {len(pairs_df):,}")
+            print(f"   Pair 로딩 중 (메모리 최적화: 청크 단위 로딩 + categorical 변환)...")
+
+            # 청크 단위로 읽으면서 즉시 변환 (OOM 방지)
+            chunk_size = 10_000_000  # 1천만 개씩
+            chunks = []
+
+            for chunk_df in pd.read_sql(pair_query, db_engine, chunksize=chunk_size):
+                # 즉시 메모리 최적화
+                chunk_df['bidntceno'] = chunk_df['bidntceno'].astype('category')
+                chunk_df['bidntceord'] = pd.to_numeric(chunk_df['bidntceord'], errors='coerce').astype('int16')
+                chunk_df['bizno'] = chunk_df['bizno'].astype('category')
+                chunks.append(chunk_df)
+                print(f"      청크 로딩: {len(chunk_df):,}개 (누적: {sum(len(c) for c in chunks):,}개)")
+
+            # 최종 병합
+            pairs_df = pd.concat(chunks, ignore_index=True)
+
+            mem_usage = pairs_df.memory_usage(deep=True).sum() / 1024**3
+            print(f"   ✅ 로딩 완료: {len(pairs_df):,}개 pair (메모리: {mem_usage:.2f} GB)")
 
     # ========================================================================
     # 2. Feature 전처리 (projection)
@@ -472,10 +632,16 @@ def create_pair_dataloaders(
         # Streaming 모드
         print(f"   Streaming 모드 (chunk_size={chunk_size:,})")
 
+        # 전체 pair 개수 확인 (pair_limit이 없는 경우)
+        total_pairs_in_db = None
+        if not pair_limit:
+            count_query = f"SELECT COUNT(*) FROM {schema.pair.table}"
+            total_pairs_in_db = pd.read_sql(count_query, db_engine).iloc[0, 0]
+            print(f"   전체 pair 수: {total_pairs_in_db:,}")
+
         # Train dataset
-        train_limit = None
-        if pair_limit:
-            train_limit = int(pair_limit * (1 - test_split))
+        effective_total = pair_limit if pair_limit else total_pairs_in_db
+        train_limit = int(effective_total * (1 - test_split)) if effective_total else None
 
         train_dataset = StreamingPairDatasetV2(
             db_engine=db_engine,
@@ -491,11 +657,9 @@ def create_pair_dataloaders(
 
         # Test dataset
         test_dataset = None
-        if test_split > 0:
-            test_offset = train_limit if train_limit else 0
-            test_limit = None
-            if pair_limit:
-                test_limit = int(pair_limit * test_split)
+        if test_split > 0 and train_limit:
+            test_offset = train_limit
+            test_limit = int(effective_total * test_split) if effective_total else None
 
             test_dataset = StreamingPairDatasetV2(
                 db_engine=db_engine,
@@ -508,6 +672,7 @@ def create_pair_dataloaders(
                 shuffle=False,
                 shuffle_seed=shuffle_seed,
             )
+            print(f"   Train limit: {train_limit:,}, Test offset: {test_offset:,}, Test limit: {test_limit:,}")
 
     else:
         # 비스트리밍 모드 (전체 메모리)
@@ -589,7 +754,12 @@ def create_pair_dataloaders(
         "notice_store": preprocessed_stores['notice'],
         "company_store": preprocessed_stores['company'],
         "schema": schema,
+        "preprocessor": preprocessor,  # 전처리기 추가
     }
+
+    # Streaming 모드면 total_pairs 추가
+    if streaming:
+        metadata["total_pairs"] = effective_total
 
     print(f"\n✅ DataLoader 생성 완료:")
     print(f"   Train batches: {len(train_loader) if not streaming else 'streaming'}")
@@ -602,8 +772,8 @@ def create_pair_dataloaders(
 
 if __name__ == "__main__":
     """테스트"""
-    from data.database_connector import DatabaseConnector
-    from preprocess.schema import build_torchrec_schema_from_meta
+    from database.database_connector import DatabaseConnector
+    from preprocess.torchrec.schema import build_torchrec_schema_from_meta
 
     print("=== PairLoaderV2 테스트 ===\n")
 
@@ -881,7 +1051,12 @@ def _create_test_mode_dataloaders(
         "notice_store": preprocessed_stores['notice'],
         "company_store": preprocessed_stores['company'],
         "schema": schema,
+        "preprocessor": preprocessor,  # 전처리기 추가
     }
+
+    # Streaming 모드면 total_pairs 추가
+    if streaming:
+        metadata["total_pairs"] = pair_limit
 
     print(f"\n✅ Test Mode DataLoader 생성 완료:")
     print(f"   Train batches: {len(train_loader) if not streaming else 'streaming'}")

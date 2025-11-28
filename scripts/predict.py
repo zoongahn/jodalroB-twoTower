@@ -54,7 +54,7 @@ from datetime import datetime
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from data.database_connector import DatabaseConnector
+from database.database_connector import DatabaseConnector
 from src.prediction import TwoTowerPredictor
 
 
@@ -101,8 +101,14 @@ def parse_args():
     parser.add_argument(
         "--vector_db",
         type=str,
-        required=True,
-        help="벡터 DB 경로 (접두사, 예: data/vectorize/embeddings)"
+        default=None,
+        help="벡터 DB 경로 (접두사, 예: data/vectorize/embeddings). --no-vector-db 사용 시 불필요"
+    )
+
+    parser.add_argument(
+        "--no-vector-db",
+        action="store_true",
+        help="Vector DB 없이 DB에서 직접 Company 임베딩 생성 (느리지만 최신 데이터 사용)"
     )
 
     # 예측 모드
@@ -165,6 +171,19 @@ def parse_args():
         help="진행 상황 출력 최소화"
     )
 
+    parser.add_argument(
+        "--json-output",
+        type=str,
+        default=None,
+        help="결과를 JSON 파일로 저장할 경로 (단일 예측 모드에서만 사용). None이면 저장하지 않음"
+    )
+
+    parser.add_argument(
+        "--return-embeddings",
+        action="store_true",
+        help="임베딩 벡터를 결과에 포함 (JSON 출력 시 함께 저장됨)"
+    )
+
     return parser.parse_args()
 
 
@@ -173,7 +192,9 @@ def predict_single(
     bidntceno: str,
     bidntceord: str,
     top_k: int,
-    min_similarity: float = None
+    min_similarity: float = None,
+    json_output_path: str = None,
+    return_embeddings: bool = False
 ):
     """단일 Notice 예측"""
     result = predictor.predict_for_notice(
@@ -181,7 +202,7 @@ def predict_single(
         bidntceord=bidntceord,
         top_k=top_k,
         min_similarity=min_similarity,
-        return_embeddings=False
+        return_embeddings=return_embeddings
     )
 
     print("\n" + "=" * 80)
@@ -223,6 +244,61 @@ def predict_single(
         col_score = f"{score:.6f}"
 
         print(f"{col_rank} {col_bizno} {col_name} {col_score}")
+
+    # JSON 파일로 저장 (옵션)
+    if json_output_path:
+        import json
+        import numpy as np
+
+        # notice_id가 tuple이나 list인 경우 분리
+        notice_id_val = result['notice_id']
+        if isinstance(notice_id_val, (tuple, list)):
+            bidntceno_val, bidntceord_val = notice_id_val[0], notice_id_val[1]
+        else:
+            # notice_id가 "bidntceno_bidntceord" 형식이면 분리
+            parts = str(notice_id_val).split('_')
+            if len(parts) >= 2:
+                bidntceno_val, bidntceord_val = parts[0], parts[1]
+            else:
+                bidntceno_val, bidntceord_val = str(notice_id_val), "000"
+
+        # Notice 정보 구성
+        notice_info = {
+            "bidntceno": bidntceno_val,
+            "bidntceord": bidntceord_val,
+            "title": result.get('notice_title')
+        }
+
+        # 임베딩이 포함되어 있으면 추가
+        if return_embeddings and 'notice_embedding' in result:
+            notice_info['embedding'] = result['notice_embedding'].tolist()
+
+        # Company 정보 구성 (dict 형식으로)
+        top_k_companies_dict = {}
+        company_names = result.get('company_names', {})
+
+        for company_id, similarity_score in result['top_k_companies']:
+            company_info = {
+                "similarity": similarity_score,
+                "name": company_names.get(company_id, None)
+            }
+
+            # Company 임베딩이 포함되어 있으면 추가
+            if return_embeddings and 'company_embeddings' in result and company_id in result['company_embeddings']:
+                company_info['embedding'] = result['company_embeddings'][company_id].tolist()
+
+            top_k_companies_dict[company_id] = company_info
+
+        # 최종 JSON 구조
+        json_result = {
+            'notice': notice_info,
+            'top_k_companies': top_k_companies_dict
+        }
+
+        with open(json_output_path, 'w', encoding='utf-8') as f:
+            json.dump(json_result, f, ensure_ascii=False, indent=2)
+
+        print(f"\n✓ JSON 결과 저장: {json_output_path}")
 
 
 def predict_batch(
@@ -312,12 +388,22 @@ def predict_batch(
 def main():
     args = parse_args()
 
+    # 인자 검증
+    use_vector_db = not args.no_vector_db
+    if use_vector_db and args.vector_db is None:
+        print("❌ 오류: Vector DB 사용 시 --vector_db 경로가 필요합니다")
+        print("   또는 --no-vector-db 플래그를 사용하세요")
+        sys.exit(1)
+
     if not args.quiet:
         print("=" * 80)
         print("Two-Tower 모델 예측 시작")
         print("=" * 80)
         print(f"체크포인트: {args.checkpoint}")
-        print(f"벡터 DB: {args.vector_db}")
+        if use_vector_db:
+            print(f"벡터 DB: {args.vector_db}")
+        else:
+            print(f"벡터 DB: 미사용 (DB에서 직접 생성)")
         print(f"Top-K: {args.top_k}")
         print(f"디바이스: {args.device}")
         print()
@@ -339,8 +425,9 @@ def main():
     # 예측기 초기화
     predictor = TwoTowerPredictor(
         checkpoint_path=args.checkpoint,
-        vector_db_path=args.vector_db,
         db_engine=engine,
+        vector_db_path=args.vector_db if use_vector_db else None,
+        use_vector_db=use_vector_db,
         config_path=args.config,
         device=args.device
     )
@@ -349,7 +436,15 @@ def main():
     if args.notice:
         # 단일 예측
         bidntceno, bidntceord = args.notice
-        predict_single(predictor, bidntceno, bidntceord, args.top_k, args.min_similarity)
+        predict_single(
+            predictor,
+            bidntceno,
+            bidntceord,
+            args.top_k,
+            args.min_similarity,
+            json_output_path=args.json_output,
+            return_embeddings=args.return_embeddings
+        )
 
     elif args.batch:
         # 배치 예측

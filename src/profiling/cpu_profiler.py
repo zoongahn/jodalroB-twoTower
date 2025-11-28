@@ -341,14 +341,17 @@ def profile_collate_function_separately(dataset, batch_size: int = 256):
                     notice_cat = dataset.notice_store['categorical'][notice_indices]
                     company_cat = dataset.company_store['categorical'][company_indices]
 
-                    from src.towers.pairs.unified_bid_data_loader import _build_batch_kjt
-                    notice_kjt = _build_batch_kjt(
-                        torch.from_numpy(notice_cat).long(),
-                        dataset.schema.notice.categorical
+                    from src.towers.kjt_utils import create_kjt_from_batch_gpu
+                    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+                    notice_kjt = create_kjt_from_batch_gpu(
+                        torch.from_numpy(notice_cat).long().to(device),
+                        dataset.schema.notice.categorical,
+                        device
                     )
-                    company_kjt = _build_batch_kjt(
-                        torch.from_numpy(company_cat).long(),
-                        dataset.schema.company.categorical
+                    company_kjt = create_kjt_from_batch_gpu(
+                        torch.from_numpy(company_cat).long().to(device),
+                        dataset.schema.company.categorical,
+                        device
                     )
 
             # PyTorch 1.x 호환성을 위해 step 호출 제거
@@ -367,8 +370,8 @@ def run_comprehensive_profiling():
     print("🔍 종합 CPU 병목 분석 시작...")
 
     # 기본 설정 (train.py와 동일)
-    from data.database_connector import DatabaseConnector
-    from preprocess.schema import build_torchrec_schema_from_meta
+    from database.database_connector import DatabaseConnector
+    from preprocess.torchrec.schema import build_torchrec_schema_from_meta
     from src.towers.pairs.unified_bid_data_loader import create_unified_bid_dataloaders
 
     db = DatabaseConnector()

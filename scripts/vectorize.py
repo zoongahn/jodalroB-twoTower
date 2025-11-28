@@ -35,8 +35,8 @@ from datetime import datetime
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from data.database_connector import DatabaseConnector
-from preprocess.schema import build_torchrec_schema_from_meta
+from database.database_connector import DatabaseConnector
+from preprocess.torchrec.schema import build_torchrec_schema_from_meta
 from src.vectorize import EmbeddingExtractor, EmbeddingStore
 
 

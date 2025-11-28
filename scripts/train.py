@@ -25,7 +25,7 @@ os.environ['TORCH_CPP_LOG_LEVEL'] = 'ERROR'
 import torch
 import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn, MofNCompleteColumn
+from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn, MofNCompleteColumn
 from rich.console import Console
 import time
 from pathlib import Path
@@ -33,10 +33,11 @@ import pandas as pd
 from datetime import datetime
 import argparse
 import json
+from collections import deque
 
 # Project imports
-from data.database_connector import DatabaseConnector
-from preprocess.schema import build_torchrec_schema_from_meta
+from database.database_connector import DatabaseConnector
+from preprocess.torchrec.schema import build_torchrec_schema_from_meta
 from src.towers.pairs.pair_loader import create_pair_dataloaders
 from src.towers.tower import NoticeTower, CompanyTower
 from src.towers.kjt_utils import create_kjt_from_batch_gpu
@@ -59,12 +60,15 @@ def save_training_results(hyperparams, metrics, output_file="train_results.csv")
         "epochs": hyperparams.get("epochs", "N/A"),
         "train_loss": metrics.get("train_loss", "N/A"),
         "train_acc": metrics.get("train_acc", "N/A"),
+        "train_pos_sim": metrics.get("train_pos_sim", "N/A"),
+        "train_sim_gap": metrics.get("train_sim_gap", "N/A"),
         "val_loss": metrics.get("val_loss", "N/A"),
         "val_acc": metrics.get("val_acc", "N/A"),
+        "val_pos_sim": metrics.get("val_pos_sim", "N/A"),
+        "val_sim_gap": metrics.get("val_sim_gap", "N/A"),
         "recall_at_5": metrics.get("recall_at_5", "N/A"),
         "recall_at_10": metrics.get("recall_at_10", "N/A"),
         "mrr": metrics.get("mrr", "N/A"),
-        "similarity_gap": metrics.get("similarity_gap", "N/A"),
         "train_batches": hyperparams.get("train_batches", "N/A"),
         "test_batches": hyperparams.get("test_batches", "N/A"),
         "gpu_optimization": hyperparams.get("gpu_optimization", "N/A"),
@@ -101,9 +105,11 @@ def parse_args():
     parser.add_argument("--pin_memory", action="store_true", default=True, help="Pin memory 사용")
     parser.add_argument("--shuffle", action="store_true", default=False, help="데이터 셔플 활성화")
     parser.add_argument("--streaming", action="store_true", default=False, help="스트리밍 모드 사용")
-    parser.add_argument("--chunk_size", type=int, default=10000, help="스트리밍 시 pair chunk 크기")
-    parser.add_argument("--feature_chunksize", type=int, default=10000, help="피처 로딩 시 chunk 크기")
+    parser.add_argument("--chunk_size", type=int, default=1000000, help="스트리밍 시 pair chunk 크기")
+    parser.add_argument("--feature_chunksize", type=int, default=100000, help="피처 로딩 시 chunk 크기")
     parser.add_argument("--test_mode", action="store_true", default=False, help="Test mode: pair_limit에 해당하는 feature만 로딩")
+    parser.add_argument("--use_parquet", action="store_true", default=False, help="DB 대신 Parquet 파일 사용")
+    parser.add_argument("--parquet_dir", type=str, default="data/parquet", help="Parquet 파일 디렉토리")
 
     # 모델 아키텍처
     parser.add_argument("--categorical_embedding_dim", type=int, default=32, help="범주형 임베딩 차원")
@@ -132,7 +138,7 @@ def parse_args():
     return parser.parse_args()
 
 
-def save_checkpoint(model, optimizer, epoch, loss, save_dir, is_best=False, is_final=False, metrics=None):
+def save_checkpoint(model, optimizer, epoch, loss, save_dir, is_best=False, is_final=False, metrics=None, preprocessor=None, scheduler=None):
     """체크포인트 저장"""
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -143,6 +149,10 @@ def save_checkpoint(model, optimizer, epoch, loss, save_dir, is_best=False, is_f
         'optimizer_state_dict': optimizer.state_dict(),
         'loss': loss,
     }
+
+    # Scheduler 상태 저장
+    if scheduler is not None:
+        checkpoint['scheduler_state_dict'] = scheduler.state_dict()
 
     if metrics is not None:
         checkpoint['metrics'] = metrics
@@ -165,17 +175,55 @@ def save_checkpoint(model, optimizer, epoch, loss, save_dir, is_best=False, is_f
         print(f"최종 모델 저장: {final_path}")
         print(f"모델 가중치 저장: {model_only_path}")
 
+        # Preprocessor 저장
+        if preprocessor is not None:
+            preprocessor_path = save_dir / 'preprocessor.pt'
+            torch.save(preprocessor, preprocessor_path)
+            print(f"전처리기 저장: {preprocessor_path}")
 
-def load_checkpoint(model, optimizer, checkpoint_path):
+
+def load_checkpoint(model, optimizer, checkpoint_path, scheduler=None, config_lr=None):
     """체크포인트 불러오기"""
     print(f"체크포인트 불러오는 중: {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location='cuda:0')
     model.load_state_dict(checkpoint['model_state_dict'])
     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+
+    # Scheduler 상태 복원
+    if scheduler is not None and 'scheduler_state_dict' in checkpoint:
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        print(f"✅ Scheduler 상태 복원 완료 (last_epoch: {checkpoint['scheduler_state_dict'].get('last_epoch', 'N/A')})")
+    elif scheduler is not None:
+        print(f"⚠️ 체크포인트에 scheduler 상태가 없습니다.")
+
+        # Optimizer의 lr이 0이면 config의 lr로 복원
+        current_lr = optimizer.param_groups[0]['lr']
+        if current_lr == 0.0 and config_lr is not None:
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = config_lr
+            print(f"   ⚠️ Optimizer lr이 0이었습니다. config lr ({config_lr})로 복원")
+
+        # Scheduler의 base_lrs와 last_epoch 설정
+        # 새로운 scheduler가 이어서 동작하도록 설정
+        start_epoch = checkpoint['epoch'] + 1
+
+        # Scheduler의 last_epoch를 설정하여 이어서 진행
+        # 주의: scheduler.step()이 호출될 때마다 last_epoch가 증가
+        # 새로운 T_max 기준으로 진행 비율 계산
+        if hasattr(scheduler, 'T_max'):
+            # 기존 진행된 step 수 추정 (epoch * batches_per_epoch)
+            # 여기서는 scheduler를 새로 시작하되, lr을 적절히 설정
+            print(f"   새로운 Scheduler 사용 (T_max: {scheduler.T_max})")
+
     start_epoch = checkpoint['epoch'] + 1
     last_loss = checkpoint['loss']
     print(f"Epoch {checkpoint['epoch']+1}부터 이어서 학습 시작")
     print(f"이전 손실: {last_loss:.4f}")
+
+    # 현재 lr 출력
+    current_lr = optimizer.param_groups[0]['lr']
+    print(f"현재 Learning Rate: {current_lr}")
+
     return start_epoch, last_loss
 
 
@@ -186,12 +234,66 @@ def contrastive_loss(notice_emb, company_emb, temperature=0.07):
     return torch.nn.functional.cross_entropy(sim_matrix, labels)
 
 
+def calculate_metrics(notice_emb, company_emb, temperature=0.07):
+    """
+    학습/검증 메트릭 계산
+
+    Returns:
+        dict: {
+            'loss': float,
+            'accuracy': float,
+            'pos_sim': float (positive similarity),
+            'sim_gap': float (similarity gap)
+        }
+    """
+    # Similarity matrix
+    sim_matrix = torch.mm(notice_emb, company_emb.t()) / temperature
+    labels = torch.arange(len(notice_emb), device=notice_emb.device)
+
+    # Loss
+    loss = torch.nn.functional.cross_entropy(sim_matrix, labels)
+
+    # Accuracy (correct predictions)
+    predictions = torch.argmax(sim_matrix, dim=1)
+    accuracy = (predictions == labels).float().mean()
+
+    # Positive similarity (diagonal elements - matching pairs)
+    pos_sim = torch.diagonal(sim_matrix).mean()
+
+    # Negative similarity (off-diagonal elements - non-matching pairs)
+    batch_size = len(notice_emb)
+    mask = ~torch.eye(batch_size, dtype=torch.bool, device=notice_emb.device)
+    neg_sim = sim_matrix[mask].mean()
+
+    # Similarity gap (positive - negative)
+    sim_gap = pos_sim - neg_sim
+
+    return {
+        'loss': loss.item(),
+        'accuracy': accuracy.item(),
+        'pos_sim': pos_sim.item(),
+        'sim_gap': sim_gap.item()
+    }
+
+
 def main():
     args = parse_args()
 
     print("=" * 80)
     print("Two-Tower V2 모델 학습 (EmbeddingBagCollection)")
     print("=" * 80)
+
+    # 기본값 저장 (resume 시 비교용)
+    import sys
+    arg_defaults = {}
+    parser = parse_args.__wrapped__ if hasattr(parse_args, '__wrapped__') else None
+
+    # 명령줄에서 명시적으로 지정된 인자 찾기
+    explicitly_set_args = set()
+    for arg in sys.argv[1:]:
+        if arg.startswith('--'):
+            arg_name = arg.lstrip('--').replace('-', '_')
+            explicitly_set_args.add(arg_name)
 
     # Config 설정
     config = {
@@ -209,6 +311,8 @@ def main():
         "chunk_size": args.chunk_size,
         "feature_chunksize": args.feature_chunksize,
         "test_mode": args.test_mode,
+        "use_parquet": args.use_parquet,
+        "parquet_dir": args.parquet_dir,
 
         # 모델 아키텍처
         "categorical_embedding_dim": args.categorical_embedding_dim,
@@ -255,13 +359,22 @@ def main():
                 with open(config_json_path, "r", encoding="utf-8") as f:
                     saved_config = json.load(f)
 
-                # Config 병합 (resume, output_dir, num_epochs 제외)
+                # Config 병합: 명령줄에서 명시한 것은 유지, 나머지는 기존 값 복원
+                overridden_params = []
                 for key in saved_config:
                     if key not in ["resume", "output_dir", "timestamp", "total_params", "trainable_params", "num_epochs"]:
                         if key in config:
-                            config[key] = saved_config[key]
+                            # 명령줄에서 명시적으로 지정된 경우 유지
+                            if key in explicitly_set_args:
+                                overridden_params.append(f"{key}: {saved_config[key]} → {config[key]}")
+                            else:
+                                config[key] = saved_config[key]
 
                 print(f"✅ 기존 하이퍼파라미터 복원 완료")
+                if overridden_params:
+                    print(f"📝 명령줄에서 재정의된 파라미터:")
+                    for param in overridden_params:
+                        print(f"   - {param}")
             else:
                 print(f"⚠️ config.json을 찾을 수 없습니다. 명령줄 인자 사용")
         else:
@@ -269,6 +382,7 @@ def main():
 
     print(f"\n🔧 설정된 하이퍼파라미터:")
     pair_limit_str = f"{config['pair_limit']:,}" if config['pair_limit'] is not None else "전체"
+    print(f"   - Data Source: {'Parquet (' + config['parquet_dir'] + ')' if config['use_parquet'] else 'Database'}")
     print(f"   - Pair Limit: {pair_limit_str}")
     print(f"   - Batch Size: {config['batch_size']}")
     print(f"   - Embedding Dim: {config['categorical_embedding_dim']} → {config['final_embedding_dim']}")
@@ -317,6 +431,8 @@ def main():
         feature_chunksize=config["feature_chunksize"],
         device=device,
         test_mode=config["test_mode"],
+        use_parquet=config["use_parquet"],
+        parquet_dir=config["parquet_dir"],
     )
 
     # Streaming 모드에서는 len() 호출 불가
@@ -427,45 +543,33 @@ def main():
     total_params = sum(p.numel() for p in model.parameters())
     print(f"\n총 파라미터: {total_params:,}\n")
 
-    # Optimizer & Loss
-    print("Optimizer & Loss 설정...")
-    optimizer = optim.AdamW(model.parameters(), lr=config["learning_rate"], weight_decay=config["weight_decay"])
-
-    # Streaming 모드에서는 len(train_loader)가 없으므로 적절한 T_max 추정
-    if config["streaming"]:
-        # pair_limit와 batch_size로 추정
-        if config["pair_limit"]:
-            estimated_batches = config["pair_limit"] // config["batch_size"]
-        else:
-            estimated_batches = 1000  # 기본값
-        scheduler = CosineAnnealingLR(optimizer, T_max=config["num_epochs"] * estimated_batches)
-        print(f"   Estimated batches per epoch: {estimated_batches}")
-    else:
-        scheduler = CosineAnnealingLR(optimizer, T_max=config["num_epochs"] * len(train_loader))
-
-    scaler = torch.amp.GradScaler("cuda", enabled=config["enable_amp"])
-
-    print(f"   Optimizer: AdamW (lr={config['learning_rate']})")
-    print(f"   Scheduler: CosineAnnealingLR")
-    print(f"   AMP: {config['enable_amp']}")
-    print(f"   torch.compile: {config['enable_torch_compile']}\n")
-
-    # Output directory 설정
+    # Resume 설정 먼저 확인 (optimizer/scheduler 생성 전에 start_epoch 결정 필요)
     best_val_loss = float('inf')
     start_epoch = 0
+    checkpoint_to_load = None
+    resumed_from = None  # 이어학습 원본 정보
 
     if config.get("resume"):
         checkpoint_path = Path(config["resume"])
         if checkpoint_path.exists():
-            start_epoch, best_val_loss = load_checkpoint(model, optimizer, checkpoint_path)
-            output_dir = checkpoint_path.parent
-            print(f"✅ 모델 로드 완료. Epoch {start_epoch}부터 재개")
-            print(f"   기존 모델 저장 경로: {output_dir}")
+            # 체크포인트에서 epoch 정보만 먼저 확인
+            checkpoint_info = torch.load(checkpoint_path, map_location='cpu')
+            start_epoch = checkpoint_info['epoch'] + 1
+            best_val_loss = checkpoint_info['loss']
+            checkpoint_to_load = checkpoint_path
+            resumed_from = str(checkpoint_path.absolute())
+
+            # 새로운 디렉토리 생성 (이어학습도 별도 디렉토리)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_dir = Path(config["output_dir"]) / f"{timestamp}_resumed"
+            output_dir.mkdir(parents=True, exist_ok=True)
+
+            print(f"📂 Resume 준비: Epoch {start_epoch}부터 재개 예정")
+            print(f"   원본 체크포인트: {checkpoint_path}")
+            print(f"   새 모델 저장 경로: {output_dir}")
         else:
             print(f"⚠️ 체크포인트를 찾을 수 없습니다: {checkpoint_path}")
             print("새로운 학습을 시작합니다.")
-            start_epoch = 0
-            best_val_loss = float('inf')
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             output_dir = Path(config["output_dir"]) / timestamp
             output_dir.mkdir(parents=True, exist_ok=True)
@@ -475,15 +579,60 @@ def main():
         output_dir.mkdir(parents=True, exist_ok=True)
         print(f"모델 저장 경로: {output_dir}")
 
-    # Config 저장
-    if not config.get("resume"):
-        config_save = config.copy()
-        config_save["timestamp"] = timestamp
-        config_save["total_params"] = total_params
-        config_save["trainable_params"] = total_params
-        with open(output_dir / "config.json", "w", encoding="utf-8") as f:
-            json.dump(config_save, f, indent=2, ensure_ascii=False)
-        print(f"학습 설정 저장: {output_dir / 'config.json'}")
+    # 이어학습 시 총 epoch 계산 (start_epoch + 추가 학습할 epoch)
+    total_epochs = start_epoch + config["num_epochs"] if config.get("resume") else config["num_epochs"]
+    print(f"📊 학습 계획: Epoch {start_epoch+1} ~ {total_epochs} (총 {config['num_epochs']} epochs 추가)")
+
+    # Optimizer & Loss
+    print("\nOptimizer & Loss 설정...")
+    optimizer = optim.AdamW(model.parameters(), lr=config["learning_rate"], weight_decay=config["weight_decay"])
+
+    # Streaming 모드에서는 len(train_loader)가 없으므로 적절한 T_max 추정
+    if config["streaming"]:
+        # pair_limit와 batch_size로 추정
+        if config["pair_limit"]:
+            estimated_batches = config["pair_limit"] // config["batch_size"]
+        else:
+            estimated_batches = 1000  # 기본값
+        # T_max는 전체 학습 기간 기준 (이어학습 시 total_epochs 사용)
+        scheduler = CosineAnnealingLR(optimizer, T_max=total_epochs * estimated_batches)
+        print(f"   Estimated batches per epoch: {estimated_batches}")
+        print(f"   Scheduler T_max: {total_epochs} epochs * {estimated_batches} batches = {total_epochs * estimated_batches}")
+    else:
+        scheduler = CosineAnnealingLR(optimizer, T_max=total_epochs * len(train_loader))
+        print(f"   Scheduler T_max: {total_epochs} epochs * {len(train_loader)} batches = {total_epochs * len(train_loader)}")
+
+    scaler = torch.amp.GradScaler("cuda", enabled=config["enable_amp"])
+
+    print(f"   Optimizer: AdamW (lr={config['learning_rate']})")
+    print(f"   Scheduler: CosineAnnealingLR")
+    print(f"   AMP: {config['enable_amp']}")
+    print(f"   torch.compile: {config['enable_torch_compile']}\n")
+
+    # 체크포인트 로드 (optimizer, scheduler 생성 후)
+    if checkpoint_to_load is not None:
+        start_epoch, best_val_loss = load_checkpoint(
+            model, optimizer, checkpoint_to_load, scheduler,
+            config_lr=config["learning_rate"]
+        )
+        print(f"✅ 모델, Optimizer, Scheduler 로드 완료. Epoch {start_epoch}부터 재개")
+
+    # Config 저장 (이어학습 시에도 저장)
+    config_save = config.copy()
+    config_save["timestamp"] = timestamp
+    config_save["total_params"] = total_params
+    config_save["trainable_params"] = total_params
+    config_save["total_epochs"] = total_epochs
+    config_save["start_epoch"] = start_epoch
+
+    # 이어학습 정보 추가
+    if resumed_from is not None:
+        config_save["resumed_from"] = resumed_from
+        config_save["resumed_epoch"] = start_epoch
+
+    with open(output_dir / "config.json", "w", encoding="utf-8") as f:
+        json.dump(config_save, f, indent=2, ensure_ascii=False)
+    print(f"학습 설정 저장: {output_dir / 'config.json'}")
 
     # 학습 루프
     console = Console()
@@ -502,22 +651,39 @@ def main():
         TextColumn("•"),
         TextColumn("[yellow]Loss: {task.fields[loss]:.4f}"),
         TextColumn("•"),
+        TextColumn("[blue]Acc: {task.fields[accuracy]:.3f}"),
+        TextColumn("•"),
+        TextColumn("[magenta]Pos-Sim: {task.fields[pos_sim]:.3f}"),
+        TextColumn("•"),
+        TextColumn("[red]Sim-Gap: {task.fields[sim_gap]:.3f}"),
+        TextColumn("•"),
         TextColumn("[green]{task.fields[throughput]:.1f} batch/s"),
+        TextColumn("•"),
         TimeElapsedColumn(),
+        TextColumn("<"),
+        TimeRemainingColumn(),
         console=console,
     )
 
     # Progress를 전체 학습 루프에서 한 번만 시작
     progress.start()
 
-    for epoch in range(start_epoch, config["num_epochs"]):
+    for epoch in range(start_epoch, total_epochs):
         model.train()
         epoch_loss = 0.0
+        epoch_acc = 0.0
+        epoch_pos_sim = 0.0
+        epoch_sim_gap = 0.0
         epoch_start_time = time.time()
-        batch_times = []
+        batch_times = deque(maxlen=config["log_interval"])  # 고정 크기 deque 사용
         batch_count = 0  # Streaming 모드를 위한 batch 카운터
 
-        console.print(f"\n[bold cyan]Epoch {epoch+1}/{config['num_epochs']}[/bold cyan]")
+        # Progress bar에 표시할 현재 메트릭 (마지막 계산값 유지)
+        last_acc = 0.0
+        last_pos_sim = 0.0
+        last_sim_gap = 0.0
+
+        console.print(f"\n[bold cyan]Epoch {epoch+1}/{total_epochs}[/bold cyan]")
 
         # Epoch 설정 (shuffle용)
         if hasattr(train_loader.dataset, 'set_epoch'):
@@ -526,8 +692,14 @@ def main():
         # Total batches 계산: pair_limit / batch_size
         if config["streaming"]:
             # Streaming: train split 고려 (test_split만큼 빼기)
-            train_pairs = int(config["pair_limit"] * (1 - config["test_split"]))
-            total_batches = train_pairs // config["batch_size"]
+            total_pairs = metadata.get("total_pairs")
+            if total_pairs is not None:
+                train_pairs = int(total_pairs * (1 - config["test_split"]))
+                total_batches = train_pairs // config["batch_size"]
+                console.print(f"   📊 Total pairs: {total_pairs:,} → Train pairs: {train_pairs:,} → Train batches: {total_batches:,}")
+            else:
+                total_batches = None
+                console.print(f"   ⚠️ total_pairs를 가져올 수 없음 (metadata: {metadata.keys()})")
         else:
             # Non-streaming: len() 사용
             try:
@@ -536,11 +708,14 @@ def main():
                 total_batches = None
 
         task = progress.add_task(
-            f"[cyan]Training Epoch {epoch+1}",
+            f"[cyan]Training Epoch {epoch+1}/{total_epochs}",
             total=total_batches,
             batch_count=0,
             total_estimate=total_batches if total_batches else "?",
             loss=0.0,
+            accuracy=0.0,
+            pos_sim=0.0,
+            sim_gap=0.0,
             throughput=0.0
         )
 
@@ -581,6 +756,10 @@ def main():
             # Backward
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
+
+            # Gradient clipping (NaN 방지)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
             scaler.step(optimizer)
             scaler.update()
 
@@ -588,39 +767,84 @@ def main():
             # scaler가 gradient를 skip하지 않았으면 scheduler도 step
             scheduler.step()
 
-            # Loss 저장 (NaN 체크)
+            # Loss 저장 (매 배치)
             import math
             current_loss = loss.item()
             if not math.isnan(current_loss) and not math.isinf(current_loss):
                 epoch_loss += current_loss
             else:
+                # NaN/Inf 발생 시 경고 및 디버깅 정보
+                if batch_count <= 10 or batch_count % 100 == 0:
+                    console.print(f"⚠️ Batch {batch_count}: Loss is {'NaN' if math.isnan(current_loss) else 'Inf'}")
+                    # 임베딩 통계 확인
+                    with torch.no_grad():
+                        notice_norm = torch.norm(notice_emb, p=2, dim=1)
+                        company_norm = torch.norm(company_emb, p=2, dim=1)
+                        sim_matrix = torch.mm(notice_emb, company_emb.t()) / config["temperature"]
+                        console.print(f"   Notice norm: min={notice_norm.min():.4f}, max={notice_norm.max():.4f}, mean={notice_norm.mean():.4f}")
+                        console.print(f"   Company norm: min={company_norm.min():.4f}, max={company_norm.max():.4f}, mean={company_norm.mean():.4f}")
+                        console.print(f"   Similarity matrix: min={sim_matrix.min():.4f}, max={sim_matrix.max():.4f}, mean={sim_matrix.mean():.4f}")
                 current_loss = 0.0
+
+            # Metrics 계산 (100배치마다 또는 처음 10개)
+            if batch_count <= 10 or batch_count % 100 == 0:
+                with torch.no_grad():
+                    metrics = calculate_metrics(notice_emb, company_emb, temperature=config["temperature"])
+                    last_acc = metrics['accuracy']
+                    last_pos_sim = metrics['pos_sim']
+                    last_sim_gap = metrics['sim_gap']
+
+                    # Epoch 누적
+                    epoch_acc += last_acc
+                    epoch_pos_sim += last_pos_sim
+                    epoch_sim_gap += last_sim_gap
 
             # 배치 시간 측정
             step_end_time = time.time()
             batch_times.append(step_end_time - step_start_time)
 
-            # Throughput 계산
+            # Throughput 계산 (deque가 자동으로 크기 제한)
             if len(batch_times) >= config["log_interval"]:
-                recent_batches = batch_times[-config["log_interval"]:]
-                avg_batch_time = sum(recent_batches) / len(recent_batches)
+                avg_batch_time = sum(batch_times) / len(batch_times)
                 batches_per_sec = 1.0 / avg_batch_time if avg_batch_time > 0 else 0
             else:
                 batches_per_sec = 0.0
 
-            # Rich progress 업데이트
-            progress.update(
-                task,
-                advance=1,
-                batch_count=batch_count,
-                loss=current_loss,
-                throughput=batches_per_sec
-            )
+            # Rich progress 업데이트 (주기적으로만 업데이트)
+            if batch_count % config["log_interval"] == 0 or batch_count <= 10:
+                progress.update(
+                    task,
+                    advance=config["log_interval"] if batch_count > 10 else 1,
+                    batch_count=batch_count,
+                    loss=current_loss,
+                    accuracy=last_acc,
+                    pos_sim=last_pos_sim,
+                    sim_gap=last_sim_gap,
+                    throughput=batches_per_sec
+                )
+            elif batch_count % 100 == 0:
+                # 100배치마다 간단히 업데이트
+                progress.update(
+                    task,
+                    advance=100,
+                    batch_count=batch_count,
+                    loss=current_loss,
+                    accuracy=last_acc,
+                    pos_sim=last_pos_sim,
+                    sim_gap=last_sim_gap,
+                    throughput=batches_per_sec
+                )
 
         # Epoch 완료
         epoch_end_time = time.time()
         epoch_duration = epoch_end_time - epoch_start_time
         avg_epoch_loss = epoch_loss / batch_count  # batch_count 사용 (streaming 호환)
+
+        # Metrics는 100배치마다 계산했으므로 샘플 수로 나눔
+        metric_sample_count = (batch_count // 100) + min(batch_count, 10)  # 100배치마다 + 처음 10개
+        avg_epoch_acc = epoch_acc / metric_sample_count if metric_sample_count > 0 else 0.0
+        avg_epoch_pos_sim = epoch_pos_sim / metric_sample_count if metric_sample_count > 0 else 0.0
+        avg_epoch_sim_gap = epoch_sim_gap / metric_sample_count if metric_sample_count > 0 else 0.0
 
         # Epoch 전체 throughput
         total_batches = batch_count  # batch_count 사용
@@ -628,15 +852,29 @@ def main():
         epoch_batches_per_sec = total_batches / epoch_duration
         epoch_samples_per_sec = total_samples / epoch_duration
 
-        console.print(f"\n[bold green]✅ Epoch {epoch+1} 완료[/bold green] - Avg Loss: {avg_epoch_loss:.4f}")
+        console.print(f"\n[bold green]✅ Epoch {epoch+1} 완료[/bold green]")
+        console.print(f"   Loss: {avg_epoch_loss:.4f} | Acc: {avg_epoch_acc:.3f} | "
+              f"Pos-Sim: {avg_epoch_pos_sim:.3f} | Sim-Gap: {avg_epoch_sim_gap:.3f}")
         console.print(f"   시간: {epoch_duration:.2f}s | "
               f"Throughput: {epoch_batches_per_sec:.2f} batch/s ({epoch_samples_per_sec:.0f} samples/s)")
 
         # Validation
         avg_val_loss = avg_epoch_loss
+        avg_val_acc = avg_epoch_acc
+        avg_val_pos_sim = avg_epoch_pos_sim
+        avg_val_sim_gap = avg_epoch_sim_gap
+
         if test_loader is not None:
             model.eval()
             val_losses = []
+            val_accs = []
+            val_pos_sims = []
+            val_sim_gaps = []
+
+            # Progress bar에 표시할 현재 메트릭 (마지막 계산값 유지)
+            val_last_acc = 0.0
+            val_last_pos_sim = 0.0
+            val_last_sim_gap = 0.0
 
             # Validation total batches
             val_total_batches = None
@@ -648,8 +886,10 @@ def main():
 
             # Streaming 모드에서는 test split 고려한 total batches 추정
             if config["streaming"] and val_total_batches is None:
-                test_pairs = int(config["pair_limit"] * config["test_split"])
-                val_total_batches = test_pairs // config["batch_size"]
+                total_pairs = metadata.get("total_pairs")
+                if total_pairs is not None:
+                    test_pairs = int(total_pairs * config["test_split"])
+                    val_total_batches = test_pairs // config["batch_size"]
 
             with torch.no_grad():
                 val_task = progress.add_task(
@@ -658,11 +898,14 @@ def main():
                     batch_count=0,
                     total_estimate=val_total_batches if val_total_batches else "?",
                     loss=0.0,
+                    accuracy=0.0,
+                    pos_sim=0.0,
+                    sim_gap=0.0,
                     throughput=0.0
                 )
 
                 val_batch_count = 0
-                val_batch_times = []
+                val_batch_times = deque(maxlen=10)  # 고정 크기 deque 사용
 
                 for batch in test_loader:
                     val_batch_start = time.time()
@@ -690,16 +933,40 @@ def main():
                         loss = contrastive_loss(notice_emb, company_emb, temperature=config["temperature"])
 
                     current_loss = loss.item()
-                    val_losses.append(loss.detach())
+
+                    # NaN 체크
+                    import math
+                    if math.isnan(current_loss) or math.isinf(current_loss):
+                        if val_batch_count <= 10 or val_batch_count % 1000 == 0:
+                            console.print(f"\n⚠️ Validation Batch {val_batch_count}: Loss is {'NaN' if math.isnan(current_loss) else 'Inf'}")
+                            with torch.no_grad():
+                                notice_norm = torch.norm(notice_emb, p=2, dim=1)
+                                company_norm = torch.norm(company_emb, p=2, dim=1)
+                                sim_matrix = torch.mm(notice_emb, company_emb.t()) / config["temperature"]
+                                console.print(f"   Notice norm: min={notice_norm.min():.4f}, max={notice_norm.max():.4f}, mean={notice_norm.mean():.4f}")
+                                console.print(f"   Company norm: min={company_norm.min():.4f}, max={company_norm.max():.4f}, mean={company_norm.mean():.4f}")
+                                console.print(f"   Similarity matrix: min={sim_matrix.min():.4f}, max={sim_matrix.max():.4f}, mean={sim_matrix.mean():.4f}")
+                    else:
+                        val_losses.append(loss.detach())
+
+                    # Metrics 계산 (100배치마다 또는 처음 10개)
+                    if val_batch_count <= 10 or val_batch_count % 100 == 0:
+                        metrics = calculate_metrics(notice_emb, company_emb, temperature=config["temperature"])
+                        val_last_acc = metrics['accuracy']
+                        val_last_pos_sim = metrics['pos_sim']
+                        val_last_sim_gap = metrics['sim_gap']
+
+                        val_accs.append(val_last_acc)
+                        val_pos_sims.append(val_last_pos_sim)
+                        val_sim_gaps.append(val_last_sim_gap)
 
                     # 배치 시간 측정
                     val_batch_end = time.time()
                     val_batch_times.append(val_batch_end - val_batch_start)
 
-                    # Throughput 계산
+                    # Throughput 계산 (deque가 자동으로 크기 제한)
                     if len(val_batch_times) >= 10:
-                        recent_batches = val_batch_times[-10:]
-                        avg_batch_time = sum(recent_batches) / len(recent_batches)
+                        avg_batch_time = sum(val_batch_times) / len(val_batch_times)
                         batches_per_sec = 1.0 / avg_batch_time if avg_batch_time > 0 else 0
                     else:
                         batches_per_sec = 0.0
@@ -710,13 +977,22 @@ def main():
                         advance=1,
                         batch_count=val_batch_count,
                         loss=current_loss,
+                        accuracy=val_last_acc,
+                        pos_sim=val_last_pos_sim,
+                        sim_gap=val_last_sim_gap,
                         throughput=batches_per_sec
                     )
 
             # val_losses가 비어있지 않은 경우에만 계산
             if len(val_losses) > 0:
                 avg_val_loss = float(torch.stack(val_losses).mean().cpu())
-                console.print(f"   [bold magenta]Val Loss: {avg_val_loss:.4f}[/bold magenta] ({val_batch_count} batches)")
+                avg_val_acc = sum(val_accs) / len(val_accs) if len(val_accs) > 0 else 0.0
+                avg_val_pos_sim = sum(val_pos_sims) / len(val_pos_sims) if len(val_pos_sims) > 0 else 0.0
+                avg_val_sim_gap = sum(val_sim_gaps) / len(val_sim_gaps) if len(val_sim_gaps) > 0 else 0.0
+
+                console.print(f"   [bold magenta]Validation ({val_batch_count} batches)[/bold magenta]")
+                console.print(f"   Loss: {avg_val_loss:.4f} | Acc: {avg_val_acc:.3f} | "
+                      f"Pos-Sim: {avg_val_pos_sim:.3f} | Sim-Gap: {avg_val_sim_gap:.3f}")
             else:
                 console.print(f"   [bold yellow]⚠️ Validation 데이터 없음 - 0 batches processed[/bold yellow]")
 
@@ -729,17 +1005,23 @@ def main():
         # 체크포인트 저장
         epoch_metrics = {
             'train_loss': avg_epoch_loss,
+            'train_acc': avg_epoch_acc,
+            'train_pos_sim': avg_epoch_pos_sim,
+            'train_sim_gap': avg_epoch_sim_gap,
             'val_loss': avg_val_loss,
+            'val_acc': avg_val_acc,
+            'val_pos_sim': avg_val_pos_sim,
+            'val_sim_gap': avg_val_sim_gap,
             'throughput_batch_s': epoch_batches_per_sec,
             'throughput_sample_s': epoch_samples_per_sec,
         }
-        
-        save_checkpoint(model, optimizer, epoch, avg_val_loss, output_dir, metrics=epoch_metrics)
+
+        save_checkpoint(model, optimizer, epoch, avg_val_loss, output_dir, metrics=epoch_metrics, scheduler=scheduler)
 
         # 최고 성능 모델 저장
         if config["save_best"] and avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
-            save_checkpoint(model, optimizer, epoch, avg_val_loss, output_dir, is_best=True, metrics=epoch_metrics)
+            save_checkpoint(model, optimizer, epoch, avg_val_loss, output_dir, is_best=True, metrics=epoch_metrics, scheduler=scheduler)
 
         # Epoch별 결과를 CSV에 저장
         print(f"   Epoch {epoch+1} 결과 기록 중...")
@@ -753,7 +1035,7 @@ def main():
             "weight_decay": config["weight_decay"],
             "dropout_rate": config["dropout_rate"],
             "temperature": config["temperature"],
-            "epochs": f"{epoch+1}/{config['num_epochs']}",  # 현재 epoch 표시
+            "epochs": f"{epoch+1}/{total_epochs}",  # 현재 epoch / 전체 epochs 표시
             "train_batches": total_batches,
             "test_batches": "streaming" if config["streaming"] else 0,
             "gpu_optimization": config["gpu_optimization"]
@@ -761,7 +1043,13 @@ def main():
 
         epoch_metrics_for_csv = {
             "train_loss": avg_epoch_loss,
+            "train_acc": avg_epoch_acc,
+            "train_pos_sim": avg_epoch_pos_sim,
+            "train_sim_gap": avg_epoch_sim_gap,
             "val_loss": avg_val_loss,
+            "val_acc": avg_val_acc,
+            "val_pos_sim": avg_val_pos_sim,
+            "val_sim_gap": avg_val_sim_gap,
             "throughput_batch_s": epoch_batches_per_sec,
             "throughput_sample_s": epoch_samples_per_sec,
         }
@@ -780,11 +1068,17 @@ def main():
     if config["save_final"]:
         final_metrics = {
             'train_loss': avg_epoch_loss,
+            'train_acc': avg_epoch_acc,
+            'train_pos_sim': avg_epoch_pos_sim,
+            'train_sim_gap': avg_epoch_sim_gap,
             'val_loss': avg_val_loss,
+            'val_acc': avg_val_acc,
+            'val_pos_sim': avg_val_pos_sim,
+            'val_sim_gap': avg_val_sim_gap,
             'throughput_batch_s': epoch_batches_per_sec,
             'throughput_sample_s': epoch_samples_per_sec,
         }
-        save_checkpoint(model, optimizer, config["num_epochs"]-1, 0.0, output_dir, is_final=True, metrics=final_metrics)
+        save_checkpoint(model, optimizer, total_epochs-1, 0.0, output_dir, is_final=True, metrics=final_metrics, preprocessor=metadata.get("preprocessor"), scheduler=scheduler)
 
     print("\n=== 학습 완료 ===")
 

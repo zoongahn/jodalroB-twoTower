@@ -1,23 +1,23 @@
 """
-TwoTowerModelV2 테스트 - 실제 DB 데이터 사용
+TwoTowerModel 테스트 - 실제 DB 데이터 사용
 
 기존 two_tower_test.py와 동일한 구조, EmbeddingBagCollection 버전
 """
 
 import torch
-from src.towers.two_tower_model_v2 import TwoTowerModelV2
+from src.towers.two_tower_model import TwoTowerModel
 from src.towers.kjt_utils import create_ebc_collate_fn_v2
-from preprocess.schema import build_torchrec_schema_from_meta
-from preprocess.feature_store import build_feature_store
-from preprocess.feature_preprocessor import FeaturePreprocessor
-from data.database_connector import DatabaseConnector
+from preprocess.torchrec.schema import build_torchrec_schema_from_meta
+from preprocess.torchrec.feature_store import build_feature_store
+from preprocess.torchrec.feature_preprocessor import FeaturePreprocessor
+from database.database_connector import DatabaseConnector
 from torchrec.modules.embedding_configs import PoolingType
 
 
 def test_two_tower_model_v2():
-    """TwoTowerModelV2 간단 테스트 - 실제 DB 데이터"""
+    """TwoTowerModel 간단 테스트 - 실제 DB 데이터"""
     print("="*80)
-    print("TwoTowerModelV2 테스트 시작 (실제 DB 데이터)")
+    print("TwoTowerModel 테스트 시작 (실제 DB 데이터)")
     print("="*80)
 
     # DB 연결 및 스키마 구축
@@ -70,14 +70,15 @@ def test_two_tower_model_v2():
     print(f"   Notice dense_projected: {preprocessed_stores['notice']['dense_projected'].shape}")
     print(f"   Company dense_projected: {preprocessed_stores['company']['dense_projected'].shape}")
 
-    # TwoTowerModelV2 생성
-    print("\n4. TwoTowerModelV2 생성...")
+    # TwoTowerModel 생성
+    print("\n4. TwoTowerModel 생성...")
 
     # CRITICAL: Notice와 Company는 dense 차원이 다름!
     # Notice: 256, Company: 128
-    from src.towers.tower_v2 import NoticeTowerV2, CompanyTowerV2
+    from src.towers.tower.notice_tower import NoticeTower
+    from src.towers.tower.company_tower import CompanyTower
 
-    notice_tower = NoticeTowerV2(
+    notice_tower = NoticeTower(
         metadata_path=config["metadata_path"],
         categorical_embedding_dim=32,
         dense_input_dim=256,  # Notice dense
@@ -89,7 +90,7 @@ def test_two_tower_model_v2():
         use_fp16=False
     )
 
-    company_tower = CompanyTowerV2(
+    company_tower = CompanyTower(
         metadata_path=config["metadata_path"],
         categorical_embedding_dim=32,
         dense_input_dim=128,  # Company dense (다름!)
@@ -211,7 +212,7 @@ def test_two_tower_model_v2():
     print("\n   ✅ Gradient 테스트 성공!")
 
     print("\n" + "="*80)
-    print("TwoTowerModelV2 테스트 완료!")
+    print("TwoTowerModel 테스트 완료!")
     print("="*80)
 
 

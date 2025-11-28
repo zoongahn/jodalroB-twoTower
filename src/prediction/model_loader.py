@@ -14,9 +14,10 @@ from pathlib import Path
 from typing import Optional, Dict
 
 from sqlalchemy.engine import Engine
-from preprocess.schema import TorchRecSchema, build_torchrec_schema_from_meta
-from preprocess.feature_preprocessor import FeaturePreprocessor
-from src.towers.two_tower_train_task import create_two_tower_train_task
+from preprocess.torchrec.schema import TorchRecSchema, build_torchrec_schema_from_meta
+from preprocess.torchrec.feature_preprocessor import FeaturePreprocessor
+from src.towers.tower.notice_tower import NoticeTower
+from src.towers.tower.company_tower import CompanyTower
 
 
 class ModelLoader:
@@ -85,27 +86,71 @@ class ModelLoader:
         else:
             self.schema = schema
 
-        # TrainTask 생성
+        # 모델 생성 (train.py와 동일한 구조)
         print("\n모델 초기화 중...")
-        self.model = create_two_tower_train_task(
-            notice_categorical_keys=self.schema.notice.categorical,
-            company_categorical_keys=self.schema.company.categorical,
+
+        notice_tower = NoticeTower(
             metadata_path=self.config.get("metadata_path", "meta/metadata.csv"),
             categorical_embedding_dim=self.config["categorical_embedding_dim"],
-            notice_dense_input_dim=self.config.get("notice_dense_input_dim", 256),
-            company_dense_input_dim=self.config.get("company_dense_input_dim", 128),
+            dense_input_dim=self.config.get("notice_dense_input_dim", 256),
             tower_hidden_dims=self.config.get("tower_hidden_dims", [512, 256]),
             final_embedding_dim=self.config["final_embedding_dim"],
             dropout_rate=self.config.get("dropout_rate", 0.1),
-            temperature=self.config.get("temperature", 1.0),
-            loss_type=self.config.get("loss_type", "cross_entropy"),
-            device=self.device
+            device=self.device,
+            use_fp16=False,
         )
+
+        company_tower = CompanyTower(
+            metadata_path=self.config.get("metadata_path", "meta/metadata.csv"),
+            categorical_embedding_dim=self.config["categorical_embedding_dim"],
+            dense_input_dim=self.config.get("company_dense_input_dim", 128),
+            tower_hidden_dims=self.config.get("tower_hidden_dims", [512, 256]),
+            final_embedding_dim=self.config["final_embedding_dim"],
+            dropout_rate=self.config.get("dropout_rate", 0.1),
+            device=self.device,
+            use_fp16=False,
+        )
+
+        # TwoTowerWrapper (train.py와 동일)
+        class TwoTowerWrapper(torch.nn.Module):
+            def __init__(self, notice_tower, company_tower):
+                super().__init__()
+                self.notice_tower = notice_tower
+                self.company_tower = company_tower
+
+            def forward(self, batch):
+                notice_emb = self.notice_tower(batch["notice"])
+                company_emb = self.company_tower(batch["company"])
+                return notice_emb, company_emb
+
+            def get_notice_embeddings(self, notice_input):
+                return self.notice_tower(notice_input)
+
+            def get_company_embeddings(self, company_input):
+                return self.company_tower(company_input)
+
+        self.model = TwoTowerWrapper(notice_tower, company_tower).to(self.device)
 
         # 체크포인트 로드
         print(f"체크포인트 로드: {self.checkpoint_path}")
         checkpoint = torch.load(self.checkpoint_path, map_location=self.device)
-        self.model.load_state_dict(checkpoint['model_state_dict'])
+
+        # State dict 키 변환 (구버전 호환성)
+        # torch.compile 모델: '_orig_mod.' prefix 제거
+        # 구버전 TwoTowerTrainTask: 'two_tower_model.' prefix 제거
+        state_dict = checkpoint['model_state_dict']
+        new_state_dict = {}
+        for key, value in state_dict.items():
+            new_key = key
+            # torch.compile로 저장된 경우
+            if new_key.startswith('_orig_mod.'):
+                new_key = new_key.replace('_orig_mod.', '')
+            # 구버전 TwoTowerTrainTask로 저장된 경우
+            if new_key.startswith('two_tower_model.'):
+                new_key = new_key.replace('two_tower_model.', '')
+            new_state_dict[new_key] = value
+
+        self.model.load_state_dict(new_state_dict, strict=False)
         self.model.eval()
 
         print(f"✓ 모델 로드 완료")
@@ -115,13 +160,17 @@ class ModelLoader:
         # Metrics 출력 (있는 경우)
         if 'metrics' in checkpoint:
             metrics = checkpoint['metrics']
-            print(f"  - Train Loss: {metrics.get('train_loss', 'N/A'):.4f}")
-            print(f"  - Val Loss: {metrics.get('val_loss', 'N/A'):.4f}")
-            print(f"  - Val Accuracy: {metrics.get('val_acc', 'N/A'):.4f}")
+            train_loss = metrics.get('train_loss', 'N/A')
+            val_loss = metrics.get('val_loss', 'N/A')
+            val_acc = metrics.get('val_acc', 'N/A')
+
+            print(f"  - Train Loss: {train_loss if train_loss == 'N/A' else f'{train_loss:.4f}'}")
+            print(f"  - Val Loss: {val_loss if val_loss == 'N/A' else f'{val_loss:.4f}'}")
+            print(f"  - Val Accuracy: {val_acc if val_acc == 'N/A' else f'{val_acc:.4f}'}")
 
     def init_preprocessor(self) -> FeaturePreprocessor:
         """
-        Preprocessor 초기화
+        Preprocessor 초기화 또는 로드
 
         Returns:
             초기화된 FeaturePreprocessor
@@ -130,15 +179,26 @@ class ModelLoader:
             raise RuntimeError("스키마가 로드되지 않았습니다. load_model()을 먼저 호출하세요.")
 
         print("\nPreprocessor 초기화 중...")
-        self.preprocessor = FeaturePreprocessor(
-            schema=self.schema,
-            device=self.device,
-            num_proj_dim=128,
-            text_proj_dim=128,
-            batch_size=1024
-        )
 
-        print("✓ Preprocessor 초기화 완료")
+        # 체크포인트와 같은 디렉토리에서 preprocessor.pt 찾기
+        checkpoint_dir = Path(self.checkpoint_path).parent
+        preprocessor_path = checkpoint_dir / 'preprocessor.pt'
+
+        if preprocessor_path.exists():
+            print(f"✓ 저장된 Preprocessor 로드: {preprocessor_path}")
+            self.preprocessor = torch.load(preprocessor_path, map_location=self.device, weights_only=False)
+            print("✓ Preprocessor 로드 완료")
+        else:
+            print("⚠️  저장된 Preprocessor 없음, 새로 초기화합니다")
+            self.preprocessor = FeaturePreprocessor(
+                schema=self.schema,
+                device=self.device,
+                num_proj_dim=128,
+                text_proj_dim=128,
+                batch_size=1024
+            )
+            print("✓ Preprocessor 초기화 완료")
+
         return self.preprocessor
 
     def get_model(self):
