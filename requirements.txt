@@ -118,6 +118,7 @@ portalocker==3.2.0
 protobuf==6.32.0
 psutil==7.1.0
 psycopg==3.2.9
+psycopg2-binary==2.9.11
 pyarrow==21.0.0
 pycparser==2.22
 pyct==0.6.0
