@@ -402,9 +402,14 @@ def main():
     print(f"\n디바이스: {device}")
     print("CUDA 가속 최적화 활성화: TF32, cuDNN benchmark\n")
 
-    # 데이터베이스 연결
-    print("데이터베이스 연결 중...")
-    db = DatabaseConnector()
+    # 데이터베이스 연결 (parquet 모드에서는 스킵)
+    db = None
+    if not config["use_parquet"]:
+        print("데이터베이스 연결 중...")
+        db = DatabaseConnector()
+    else:
+        print("Parquet 모드: 데이터베이스 연결 스킵")
+
     schema = build_torchrec_schema_from_meta(
         pair_notice_id_cols=["bidntceno", "bidntceord"],
         pair_company_id_cols=["bizno"],
@@ -417,7 +422,7 @@ def main():
     # DataLoader 생성 (V2)
     print("\nDataLoader 생성 중... (PairLoaderV2 - EmbeddingBagCollection용)")
     train_loader, test_loader, metadata = create_pair_dataloaders(
-        db_engine=db.engine,
+        db_engine=db.engine if db else None,
         schema=schema,
         batch_size=config["batch_size"],
         pair_limit=config["pair_limit"],
