@@ -866,14 +866,19 @@ def _create_test_mode_dataloaders(
     print(f"Pair limit: {pair_limit:,}")
     print(f"Streaming: {streaming}")
     print(f"Chunk size: {chunk_size if streaming else 'N/A'}")
-    print(f"데이터 소스: {'Parquet' if use_parquet else 'Database'}")
+    print(f"데이터 소스: {'Parquet (DuckDB)' if use_parquet else 'Database'}")
 
     # ========================================================================
     # 1. 제한된 pair 로딩
     # ========================================================================
     print("\n1. 제한된 pair 로딩...")
     if use_parquet:
-        pairs_df = pd.read_parquet(f"{parquet_dir}/pairs.parquet").head(pair_limit)
+        import duckdb
+        pairs_df = duckdb.query(f"""
+            SELECT bidntceno, bidntceord, bizno
+            FROM '{parquet_dir}/pairs.parquet'
+            LIMIT {pair_limit}
+        """).df()
     else:
         pair_query = f"""
         SELECT bidntceno, bidntceord, bizno

@@ -452,7 +452,7 @@ def load_feature_store_from_parquet_filtered(
     show_progress: bool = True,
 ) -> Dict:
     """
-    Parquet 파일에서 특정 ID만 필터링하여 Feature Store 로딩
+    Parquet 파일에서 특정 ID만 필터링하여 Feature Store 로딩 (DuckDB 사용)
 
     Args:
         parquet_path: Parquet 파일 경로
@@ -463,35 +463,50 @@ def load_feature_store_from_parquet_filtered(
     Returns:
         dict: {"ids": list, "numeric": ndarray, "categorical": ndarray, "text": dict}
     """
+    import duckdb
+
     parquet_path = Path(parquet_path)
 
     if not parquet_path.exists():
         raise FileNotFoundError(f"Parquet 파일을 찾을 수 없습니다: {parquet_path}")
 
-    print(f"  🔧 load_feature_store_from_parquet_filtered: {parquet_path.name}")
+    print(f"  🔧 load_feature_store_from_parquet_filtered (DuckDB): {parquet_path.name}")
     print(f"     필터링할 ID 수: {len(filter_ids):,}")
 
     start_time = time.time()
 
-    # Parquet 전체 로드 후 필터링 (작은 데이터셋에서 효율적)
-    df = pd.read_parquet(parquet_path)
-
-    if show_progress:
-        print(f"     ✓ Parquet 로드 완료 ({len(df):,} rows, {time.time() - start_time:.2f}s)")
-
-    # 필터링
+    # DuckDB로 선택적 로딩
     pk_cols = side_schema.pk_cols
+
     if len(pk_cols) == 1:
         # 단일 키 (예: bizno)
-        df = df[df[pk_cols[0]].astype(str).isin(filter_ids)]
+        id_list = [f"'{id}'" for id in filter_ids]
+        where_clause = f"{pk_cols[0]} IN ({','.join(id_list)})"
     else:
         # 복합 키 (예: bidntceno, bidntceord)
-        df = df[df.apply(lambda x: tuple(x[col] for col in pk_cols) in filter_ids, axis=1)]
+        conditions = []
+        for id_tuple in filter_ids:
+            cond_parts = []
+            for col, val in zip(pk_cols, id_tuple):
+                if isinstance(val, str):
+                    cond_parts.append(f"{col} = '{val}'")
+                else:
+                    cond_parts.append(f"{col} = {val}")
+            conditions.append(f"({' AND '.join(cond_parts)})")
+        where_clause = " OR ".join(conditions)
+
+    query = f"""
+        SELECT *
+        FROM '{parquet_path}'
+        WHERE {where_clause}
+    """
+
+    df = duckdb.query(query).df()
 
     if show_progress:
-        print(f"     ✓ 필터링 완료 ({len(df):,} rows, {time.time() - start_time:.2f}s)")
+        print(f"     ✓ DuckDB 쿼리 완료 ({len(df):,} rows, {time.time() - start_time:.2f}s)")
 
-    # Key-to-row mapping (재인덱싱 필요)
+    # Key-to-row mapping
     df = df.reset_index(drop=True)
     key_to_row = {}
     for idx, row in df.iterrows():
