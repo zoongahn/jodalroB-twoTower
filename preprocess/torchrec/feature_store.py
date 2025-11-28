@@ -445,6 +445,96 @@ def _load_feature_store_chunked(
 
 
 
+def load_feature_store_from_parquet_filtered(
+    parquet_path: str | Path,
+    side_schema: SideSchema,
+    filter_ids: set,
+    show_progress: bool = True,
+) -> Dict:
+    """
+    Parquet 파일에서 특정 ID만 필터링하여 Feature Store 로딩
+
+    Args:
+        parquet_path: Parquet 파일 경로
+        side_schema: 스키마 정보
+        filter_ids: 필터링할 ID set (튜플 또는 단일값)
+        show_progress: 진행률 표시 여부
+
+    Returns:
+        dict: {"ids": list, "numeric": ndarray, "categorical": ndarray, "text": dict}
+    """
+    parquet_path = Path(parquet_path)
+
+    if not parquet_path.exists():
+        raise FileNotFoundError(f"Parquet 파일을 찾을 수 없습니다: {parquet_path}")
+
+    print(f"  🔧 load_feature_store_from_parquet_filtered: {parquet_path.name}")
+    print(f"     필터링할 ID 수: {len(filter_ids):,}")
+
+    start_time = time.time()
+
+    # Parquet 전체 로드 후 필터링 (작은 데이터셋에서 효율적)
+    df = pd.read_parquet(parquet_path)
+
+    if show_progress:
+        print(f"     ✓ Parquet 로드 완료 ({len(df):,} rows, {time.time() - start_time:.2f}s)")
+
+    # 필터링
+    pk_cols = side_schema.pk_cols
+    if len(pk_cols) == 1:
+        # 단일 키 (예: bizno)
+        df = df[df[pk_cols[0]].astype(str).isin(filter_ids)]
+    else:
+        # 복합 키 (예: bidntceno, bidntceord)
+        df = df[df.apply(lambda x: tuple(x[col] for col in pk_cols) in filter_ids, axis=1)]
+
+    if show_progress:
+        print(f"     ✓ 필터링 완료 ({len(df):,} rows, {time.time() - start_time:.2f}s)")
+
+    # Key-to-row mapping (재인덱싱 필요)
+    df = df.reset_index(drop=True)
+    key_to_row = {}
+    for idx, row in df.iterrows():
+        key = tuple(row[col] for col in pk_cols)
+        key_to_row[key] = idx
+
+    # Numeric features
+    num_mat = None
+    if side_schema.numeric:
+        num_mat = df[side_schema.numeric].astype("float32").to_numpy(dtype="float32", copy=False)
+
+    # Categorical features
+    cat_mat = None
+    if side_schema.categorical:
+        cat_mat = df[side_schema.categorical].astype("int64").to_numpy(dtype="int64", copy=False)
+
+    # Text embeddings
+    txt_mat = None
+    vec_dims = side_schema.text_embed_dims or 768
+
+    if side_schema.text:
+        txt_mat = {}
+        for col in side_schema.text:
+            emb_array = np.stack([
+                np.array(emb, dtype=np.float32) if emb is not None
+                else np.zeros(vec_dims, dtype=np.float32)
+                for emb in df[col]
+            ])
+            txt_mat[col] = emb_array
+
+    result = {
+        "ids": list(key_to_row.keys()),
+        "numeric": num_mat,
+        "categorical": cat_mat,
+        "text": txt_mat,
+    }
+
+    if show_progress:
+        print(f"     ✓ Feature 추출 완료 ({time.time() - start_time:.2f}s)")
+
+    return result
+
+
 if __name__ == "__main__":
     from preprocess.torchrec.schema import build_torchrec_schema_from_meta
     from database.database_connector import DatabaseConnector

@@ -18,7 +18,7 @@ from sqlalchemy.engine import Engine
 from pathlib import Path
 
 from preprocess.torchrec.schema import TorchRecSchema
-from preprocess.torchrec.feature_store import build_feature_store, build_feature_store_with_condition, load_feature_store_from_parquet
+from preprocess.torchrec.feature_store import build_feature_store, build_feature_store_with_condition, load_feature_store_from_parquet, load_feature_store_from_parquet_filtered
 from preprocess.torchrec.feature_preprocessor import FeaturePreprocessor
 
 
@@ -399,6 +399,8 @@ def create_pair_dataloaders(
             streaming=streaming,
             chunk_size=chunk_size,
             device=device,
+            use_parquet=use_parquet,
+            parquet_dir=parquet_dir,
         )
 
     print("\n" + "="*80)
@@ -850,6 +852,8 @@ def _create_test_mode_dataloaders(
     streaming: bool,
     chunk_size: int,
     device: torch.device,
+    use_parquet: bool = False,
+    parquet_dir: str = "data/parquet",
 ) -> Tuple[DataLoader, DataLoader, Dict]:
     """
     Test Mode용 DataLoader 생성 - pair_limit에 해당하는 feature만 선택적 로딩
@@ -862,18 +866,22 @@ def _create_test_mode_dataloaders(
     print(f"Pair limit: {pair_limit:,}")
     print(f"Streaming: {streaming}")
     print(f"Chunk size: {chunk_size if streaming else 'N/A'}")
+    print(f"데이터 소스: {'Parquet' if use_parquet else 'Database'}")
 
     # ========================================================================
     # 1. 제한된 pair 로딩
     # ========================================================================
     print("\n1. 제한된 pair 로딩...")
-    pair_query = f"""
-    SELECT bidntceno, bidntceord, bizno
-    FROM {schema.pair.table}
-    ORDER BY id
-    LIMIT {pair_limit}
-    """
-    pairs_df = pd.read_sql(pair_query, db_engine)
+    if use_parquet:
+        pairs_df = pd.read_parquet(f"{parquet_dir}/pairs.parquet").head(pair_limit)
+    else:
+        pair_query = f"""
+        SELECT bidntceno, bidntceord, bizno
+        FROM {schema.pair.table}
+        ORDER BY id
+        LIMIT {pair_limit}
+        """
+        pairs_df = pd.read_sql(pair_query, db_engine)
     print(f"   로딩된 pair 수: {len(pairs_df):,}")
 
     # ========================================================================
@@ -887,29 +895,36 @@ def _create_test_mode_dataloaders(
     print(f"   Company ID 수: {len(company_ids):,}")
 
     # ========================================================================
-    # 3. 선택적 feature 로딩 (SQL WHERE 조건)
+    # 3. 선택적 feature 로딩
     # ========================================================================
     print("\n3. 선택적 Feature 로딩...")
 
-    # Notice WHERE 조건
-    notice_conditions = []
-    for bidntceno, bidntceord in list(notice_ids):
-        notice_conditions.append(
-            f"(bidntceno='{bidntceno}' AND bidntceord::integer={int(bidntceord)})"
+    if use_parquet:
+        # Parquet 모드: 필터링된 로딩
+        notice_store = load_feature_store_from_parquet_filtered(
+            f"{parquet_dir}/notice.parquet", schema.notice, filter_ids=notice_ids, show_progress=True
         )
-    notice_where = " OR ".join(notice_conditions)
+        company_store = load_feature_store_from_parquet_filtered(
+            f"{parquet_dir}/company.parquet", schema.company, filter_ids=company_ids, show_progress=True
+        )
+    else:
+        # DB 모드: SQL WHERE 조건
+        notice_conditions = []
+        for bidntceno, bidntceord in list(notice_ids):
+            notice_conditions.append(
+                f"(bidntceno='{bidntceno}' AND bidntceord::integer={int(bidntceord)})"
+            )
+        notice_where = " OR ".join(notice_conditions)
 
-    # Company WHERE 조건
-    company_quoted_ids = [f"'{cid}'" for cid in company_ids]
-    company_where = "bizno IN (" + ",".join(company_quoted_ids) + ")"
+        company_quoted_ids = [f"'{cid}'" for cid in company_ids]
+        company_where = "bizno IN (" + ",".join(company_quoted_ids) + ")"
 
-    # Feature store 로딩
-    notice_store = build_feature_store_with_condition(
-        db_engine, schema.notice, where_condition=notice_where, show_progress=True
-    )
-    company_store = build_feature_store_with_condition(
-        db_engine, schema.company, where_condition=company_where, show_progress=True
-    )
+        notice_store = build_feature_store_with_condition(
+            db_engine, schema.notice, where_condition=notice_where, show_progress=True
+        )
+        company_store = build_feature_store_with_condition(
+            db_engine, schema.company, where_condition=company_where, show_progress=True
+        )
 
     print(f"   Notice features: {len(notice_store['ids']):,}")
     print(f"   Company features: {len(company_store['ids']):,}")
