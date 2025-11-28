@@ -5,7 +5,7 @@ SSH_KEY="~/.ssh/id_ed25519"
 HOST="216.81.245.26"
 PORT="43567"
 USER="root"
-REMOTE_PATH="/data/dev/jodalroB-twoTower/data/parquet"
+REMOTE_PATH="/work/jodalroB-twoTower/data/parquet"
 
 # 원격 디렉토리 생성
 ssh -i $SSH_KEY -p $PORT -o StrictHostKeyChecking=no ${USER}@${HOST} "mkdir -p $REMOTE_PATH"
