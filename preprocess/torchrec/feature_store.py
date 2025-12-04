@@ -523,18 +523,21 @@ def load_feature_store_from_parquet_filtered(
     if side_schema.categorical:
         cat_mat = df[side_schema.categorical].astype("int64").to_numpy(dtype="int64", copy=False)
 
-    # Text embeddings
+    # Text embeddings - 메모리 효율적 방식
     txt_mat = None
     vec_dims = side_schema.text_embed_dims or 768
 
     if side_schema.text:
         txt_mat = {}
         for col in side_schema.text:
-            emb_array = np.stack([
-                np.array(emb, dtype=np.float32) if emb is not None
-                else np.zeros(vec_dims, dtype=np.float32)
-                for emb in df[col]
-            ])
+            # 미리 할당 후 채우기 (np.stack 대신)
+            num_rows = len(df)
+            emb_array = np.empty((num_rows, vec_dims), dtype=np.float32)
+            for i, emb in enumerate(df[col]):
+                if emb is not None:
+                    emb_array[i] = np.array(emb, dtype=np.float32)
+                else:
+                    emb_array[i] = 0.0
             txt_mat[col] = emb_array
 
     result = {
