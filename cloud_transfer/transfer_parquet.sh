@@ -2,8 +2,8 @@
 # Parquet 파일을 RunPod 서버 1로 전송 (rsync 압축 전송)
 
 SSH_KEY="~/.ssh/id_ed25519"
-HOST="198.145.108.49"
-PORT="14651"
+HOST="62.169.159.178"
+PORT="34041"
 USER="root"
 REMOTE_PATH="/data/dev/jodalroB-twoTower/data/parquet"
 LOCAL_PATH="/data/dev/jodalroB-twoTower/data/parquet"
