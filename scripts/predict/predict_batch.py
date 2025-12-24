@@ -92,7 +92,118 @@ class BatchPredictor:
         self._company_ids: Optional[List[str]] = None
         self._company_embeddings: Optional[np.ndarray] = None
 
+        # company_id → index 매핑 캐시
+        self._company_id_to_idx: Optional[Dict[str, int]] = None
+
         print("✓ BatchPredictor 초기화 완료")
+
+    def _get_eligible_companies_batch(
+        self,
+        notice_ids: List[Tuple[str, str]],
+        chunk_size: int = 500
+    ) -> Dict[Tuple[str, str], Optional[set]]:
+        """
+        N개 공고의 업종코드에 해당하는 참여가능 업체 목록 일괄 조회
+
+        Args:
+            notice_ids: [(bidntceno, bidntceord), ...] 리스트
+            chunk_size: DB 쿼리당 공고 수 (기본: 500, PostgreSQL 스택 제한 회피)
+
+        Returns:
+            {(bidntceno, bidntceord): set(bizno) or None} 딕셔너리
+            - None이면 해당 공고에 업종코드가 없음 (전체 업체 대상)
+        """
+        if not notice_ids:
+            return {}
+
+        result = {nid: None for nid in notice_ids}
+
+        try:
+            # 1. N개 공고의 업종코드 청크 단위로 조회
+            notice_to_codes = {}
+            num_chunks = (len(notice_ids) + chunk_size - 1) // chunk_size
+
+            print(f"  1. 공고 업종코드 조회 중 ({len(notice_ids)}개, {num_chunks}개 청크)...")
+
+            for chunk_idx in range(num_chunks):
+                start_idx = chunk_idx * chunk_size
+                end_idx = min(start_idx + chunk_size, len(notice_ids))
+                chunk_ids = notice_ids[start_idx:end_idx]
+
+                values = ", ".join([
+                    f"('{ntce_no}', '{ntce_ord}')"
+                    for ntce_no, ntce_ord in chunk_ids
+                ])
+                industry_query = f"""
+                SELECT bidntceno, bidntceord, lcnslmtnm_code
+                FROM public.notice_industry_type
+                WHERE (bidntceno, bidntceord) IN ({values})
+                """
+                chunk_df = pd.read_sql(industry_query, self.db_engine)
+
+                for _, row in chunk_df.iterrows():
+                    key = (row['bidntceno'], row['bidntceord'])
+                    if key not in notice_to_codes:
+                        notice_to_codes[key] = []
+                    notice_to_codes[key].append(row['lcnslmtnm_code'])
+
+            if len(notice_to_codes) == 0:
+                print(f"  ⚠️  {len(notice_ids)}개 공고 모두 업종코드 없음. 전체 업체 대상으로 예측합니다.")
+                return result
+
+            # 업종코드가 있는 공고 수
+            notices_with_codes = len(notice_to_codes)
+            notices_without_codes = len(notice_ids) - notices_with_codes
+            print(f"  ✓ 업종코드 조회: {notices_with_codes}개 공고에 업종코드 있음, {notices_without_codes}개 없음")
+
+            # 2. 모든 고유 업종코드에 해당하는 업체 일괄 조회
+            all_codes = set()
+            for codes in notice_to_codes.values():
+                all_codes.update(codes)
+
+            if not all_codes:
+                return result
+
+            print(f"  2. 업종별 업체 조회 중 ({len(all_codes)}개 업종코드)...")
+
+            codes_str = "','".join(str(code) for code in all_codes)
+            company_query = f"""
+            SELECT DISTINCT bizno, indstrytycd
+            FROM public.company_industry_type
+            WHERE indstrytycd IN ('{codes_str}')
+            """
+            company_df = pd.read_sql(company_query, self.db_engine)
+
+            # 업종코드별 업체 목록 생성
+            code_to_companies = {}
+            for _, row in company_df.iterrows():
+                code = row['indstrytycd']
+                if code not in code_to_companies:
+                    code_to_companies[code] = set()
+                code_to_companies[code].add(row['bizno'])
+
+            print(f"  ✓ 업종별 업체 조회: {len(all_codes)}개 업종코드, {len(company_df)}개 업체-업종 매핑")
+
+            # 3. 각 공고별 참여가능 업체 set 생성
+            for notice_id, codes in notice_to_codes.items():
+                eligible = set()
+                for code in codes:
+                    if code in code_to_companies:
+                        eligible.update(code_to_companies[code])
+                if eligible:
+                    result[notice_id] = eligible
+
+            # 통계 출력
+            eligible_counts = [len(v) for v in result.values() if v is not None]
+            if eligible_counts:
+                print(f"  ✓ 참여가능 업체 수: 평균 {np.mean(eligible_counts):,.0f}개, "
+                      f"최소 {min(eligible_counts):,}개, 최대 {max(eligible_counts):,}개")
+
+            return result
+
+        except Exception as e:
+            print(f"  ⚠️  업종 기반 업체 조회 실패: {e}. 전체 업체 대상으로 예측합니다.")
+            return result
 
     def load_all_company_embeddings(self, batch_size: int = 1024) -> Tuple[List[str], np.ndarray]:
         """
@@ -183,6 +294,7 @@ class BatchPredictor:
         # 캐시 저장
         self._company_ids = company_ids
         self._company_embeddings = company_embeddings
+        self._company_id_to_idx = {cid: idx for idx, cid in enumerate(company_ids)}
 
         return company_ids, company_embeddings
 
@@ -385,7 +497,8 @@ class BatchPredictor:
         notices: List[Dict],  # [{"bidntceno": str, "bidntceord": str, "bid_count": int}, ...]
         company_batch_size: int = 1024,
         notice_batch_size: int = 512,
-        db_chunk_size: int = 1000
+        db_chunk_size: int = 1000,
+        use_industry_filter: bool = True
     ) -> Dict:
         """
         N개 공고에 대해 효율적인 배치 예측 수행
@@ -395,6 +508,9 @@ class BatchPredictor:
             company_batch_size: 회사 임베딩 생성 배치 크기
             notice_batch_size: 공고 임베딩 생성 배치 크기
             db_chunk_size: DB 쿼리당 공고 수 (대량 처리시 청크 단위)
+            use_industry_filter: 업종 필터 사용 여부 (기본값: True)
+                - True: 공고의 업종코드에 해당하는 업체만 대상으로 예측
+                - False: 전체 업체 대상으로 예측
 
         Returns:
             Dict: {
@@ -407,6 +523,7 @@ class BatchPredictor:
         """
         print("\n" + "=" * 80)
         print(f"배치 예측 시작: {len(notices)}개 공고")
+        print(f"업종 필터: {'사용' if use_industry_filter else '미사용'}")
         print("=" * 80)
 
         total_start = time.time()
@@ -454,7 +571,15 @@ class BatchPredictor:
             for n in notices
         }
 
-        # 3. 코사인 유사도 계산 (N x M 행렬 연산)
+        # 3. 업종 필터링 정보 조회 (선택적)
+        eligible_companies_map = {}
+        if use_industry_filter:
+            print("\n" + "-" * 60)
+            print("STEP: 업종 기반 참여가능 업체 조회")
+            print("-" * 60)
+            eligible_companies_map = self._get_eligible_companies_batch(valid_notice_ids)
+
+        # 4. 코사인 유사도 계산 (N x M 행렬 연산)
         print("\n" + "-" * 60)
         print("STEP: 유사도 계산 및 Top-K 추출")
         print("-" * 60)
@@ -471,8 +596,10 @@ class BatchPredictor:
         sim_elapsed = time.time() - sim_start
         print(f"   ✓ 유사도 행렬: shape={similarity_matrix.shape}, 소요시간={sim_elapsed:.2f}초")
 
-        # 4. 각 공고별 Top-K 추출
+        # 5. 각 공고별 Top-K 추출 (업종 필터링 적용)
         print("2. Top-K 회사 추출 중...")
+        if use_industry_filter:
+            print("   (업종 필터 적용)")
         predictions = []
 
         for notice_id in tqdm(valid_notice_ids, desc="   Top-K 추출"):
@@ -482,25 +609,60 @@ class BatchPredictor:
             # bid_count 가져오기
             k = bid_count_map.get(notice_id, 10)  # 기본값 10
 
-            # Top-K 인덱스 (내림차순)
-            if k >= len(company_ids):
-                top_k_indices = np.argsort(similarities)[::-1]
-            else:
-                # argpartition으로 효율적으로 top-k 추출
-                top_k_indices = np.argpartition(similarities, -k)[-k:]
-                top_k_indices = top_k_indices[np.argsort(similarities[top_k_indices])[::-1]]
+            # 업종 필터링 적용
+            eligible_set = eligible_companies_map.get(notice_id) if use_industry_filter else None
 
-            top_k_companies = [
-                (company_ids[idx], float(similarities[idx]))
-                for idx in top_k_indices
-            ]
+            if eligible_set is not None:
+                # 참여가능 업체만 필터링하여 Top-K 추출
+                # eligible_set에 있는 업체의 인덱스만 추출
+                eligible_indices = [
+                    self._company_id_to_idx[cid]
+                    for cid in eligible_set
+                    if cid in self._company_id_to_idx
+                ]
+
+                if len(eligible_indices) == 0:
+                    # 참여가능 업체가 없으면 빈 결과
+                    top_k_companies = []
+                else:
+                    eligible_indices = np.array(eligible_indices)
+                    eligible_similarities = similarities[eligible_indices]
+
+                    # Top-K 추출 (eligible 범위 내에서)
+                    actual_k = min(k, len(eligible_indices))
+                    if actual_k >= len(eligible_indices):
+                        top_k_local_indices = np.argsort(eligible_similarities)[::-1]
+                    else:
+                        top_k_local_indices = np.argpartition(eligible_similarities, -actual_k)[-actual_k:]
+                        top_k_local_indices = top_k_local_indices[
+                            np.argsort(eligible_similarities[top_k_local_indices])[::-1]
+                        ]
+
+                    top_k_companies = [
+                        (company_ids[eligible_indices[local_idx]], float(eligible_similarities[local_idx]))
+                        for local_idx in top_k_local_indices
+                    ]
+            else:
+                # 업종 필터 미적용 또는 업종코드 없음 → 전체 대상
+                if k >= len(company_ids):
+                    top_k_indices = np.argsort(similarities)[::-1]
+                else:
+                    # argpartition으로 효율적으로 top-k 추출
+                    top_k_indices = np.argpartition(similarities, -k)[-k:]
+                    top_k_indices = top_k_indices[np.argsort(similarities[top_k_indices])[::-1]]
+
+                top_k_companies = [
+                    (company_ids[idx], float(similarities[idx]))
+                    for idx in top_k_indices
+                ]
 
             predictions.append({
                 "notice_id": notice_id,
                 "bidntceno": notice_id[0],
                 "bidntceord": notice_id[1],
                 "bid_count": k,
-                "top_k_companies": top_k_companies
+                "top_k_companies": top_k_companies,
+                "industry_filtered": eligible_set is not None
             })
 
         total_elapsed = time.time() - total_start
@@ -569,6 +731,12 @@ def parse_args():
         type=int,
         default=1000,
         help="DB 쿼리당 공고 수 (대량 처리시 청크 단위, 기본: 1000)"
+    )
+
+    parser.add_argument(
+        "--no-industry-filter",
+        action="store_true",
+        help="업종 필터 미사용. 전체 업체 대상으로 예측 (기본값: 업종 필터 사용)"
     )
 
     return parser.parse_args()
@@ -674,12 +842,16 @@ def main():
             device=args.device
         )
 
+        # 업종 필터 옵션 처리
+        use_industry_filter = not args.no_industry_filter
+
         # 배치 예측 수행
         result = predictor.predict_batch(
             notices=notices,
             company_batch_size=args.company_batch_size,
             notice_batch_size=args.notice_batch_size,
-            db_chunk_size=args.db_chunk_size
+            db_chunk_size=args.db_chunk_size,
+            use_industry_filter=use_industry_filter
         )
 
         predictions = result["predictions"]
@@ -701,6 +873,7 @@ def main():
             bidntceno = pred["bidntceno"]
             bidntceord = pred["bidntceord"]
             bid_count = pred["bid_count"]
+            industry_filtered = pred.get("industry_filtered", False)
 
             for rank, (company_id, similarity) in enumerate(pred["top_k_companies"], 1):
                 rows.append({
@@ -709,7 +882,8 @@ def main():
                     "bid_count": bid_count,
                     "rank": rank,
                     "bizno": company_id,
-                    "similarity": similarity
+                    "similarity": similarity,
+                    "industry_filtered": industry_filtered
                 })
 
         result_df = pd.DataFrame(rows)

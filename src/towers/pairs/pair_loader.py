@@ -342,6 +342,7 @@ def create_pair_dataloaders(
     test_mode: bool = False,
     use_parquet: bool = False,
     parquet_dir: str = "data/parquet",
+    preprocessor: Optional[FeaturePreprocessor] = None,  # Resume 시 기존 preprocessor 사용
 ) -> Tuple[DataLoader, DataLoader, Dict]:
     """
     Pair DataLoader V2 생성 (EmbeddingBagCollection용)
@@ -374,6 +375,7 @@ def create_pair_dataloaders(
         test_mode: True면 pair_limit에 해당하는 feature만 로딩
         use_parquet: True면 DB 대신 Parquet 파일 사용
         parquet_dir: Parquet 파일 디렉토리
+        preprocessor: Resume 시 기존 학습에서 사용한 FeaturePreprocessor (None이면 새로 생성)
 
     Returns:
         (train_loader, test_loader, metadata)
@@ -401,6 +403,7 @@ def create_pair_dataloaders(
             device=device,
             use_parquet=use_parquet,
             parquet_dir=parquet_dir,
+            preprocessor=preprocessor,
         )
 
     print("\n" + "="*80)
@@ -612,13 +615,21 @@ def create_pair_dataloaders(
     # 2. Feature 전처리 (projection)
     # ========================================================================
     print("\n2. Feature 전처리 (projection)...")
-    preprocessor = FeaturePreprocessor(
-        schema=schema,
-        device=device,
-        num_proj_dim=128,
-        text_proj_dim=128,
-        batch_size=1024
-    )
+    if preprocessor is None:
+        print("   새로운 FeaturePreprocessor 생성")
+        preprocessor = FeaturePreprocessor(
+            schema=schema,
+            device=device,
+            num_proj_dim=128,
+            text_proj_dim=128,
+            batch_size=1024
+        )
+    else:
+        print("   ✅ 기존 FeaturePreprocessor 사용 (Resume 모드)")
+        # device 이동 확인
+        preprocessor.device = device
+        for tower_name, proj in preprocessor.projectors.items():
+            proj.to(device)
 
     preprocessed_stores = preprocessor.preprocess_stores(notice_store, company_store)
 
@@ -854,6 +865,7 @@ def _create_test_mode_dataloaders(
     device: torch.device,
     use_parquet: bool = False,
     parquet_dir: str = "data/parquet",
+    preprocessor: Optional[FeaturePreprocessor] = None,  # Resume 시 기존 preprocessor 사용
 ) -> Tuple[DataLoader, DataLoader, Dict]:
     """
     Test Mode용 DataLoader 생성 - pair_limit에 해당하는 feature만 선택적 로딩
@@ -938,13 +950,21 @@ def _create_test_mode_dataloaders(
     # 4. Feature 전처리 (projection)
     # ========================================================================
     print("\n4. Feature 전처리...")
-    preprocessor = FeaturePreprocessor(
-        schema=schema,
-        device=device,
-        num_proj_dim=128,
-        text_proj_dim=128,
-        batch_size=1024
-    )
+    if preprocessor is None:
+        print("   새로운 FeaturePreprocessor 생성")
+        preprocessor = FeaturePreprocessor(
+            schema=schema,
+            device=device,
+            num_proj_dim=128,
+            text_proj_dim=128,
+            batch_size=1024
+        )
+    else:
+        print("   ✅ 기존 FeaturePreprocessor 사용 (Resume 모드)")
+        # device 이동 확인
+        preprocessor.device = device
+        for tower_name, proj in preprocessor.projectors.items():
+            proj.to(device)
 
     preprocessed_stores = preprocessor.preprocess_stores(notice_store, company_store)
     print(f"   Notice dense_projected: {preprocessed_stores['notice']['dense_projected'].shape}")

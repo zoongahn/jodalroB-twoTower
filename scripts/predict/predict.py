@@ -184,6 +184,19 @@ def parse_args():
         help="임베딩 벡터를 결과에 포함 (JSON 출력 시 함께 저장됨)"
     )
 
+    parser.add_argument(
+        "--use-industry-filter",
+        action="store_true",
+        default=True,
+        help="업종 필터 사용 (기본값: True). 공고의 업종코드에 해당하는 업체만 대상으로 예측"
+    )
+
+    parser.add_argument(
+        "--no-industry-filter",
+        action="store_true",
+        help="업종 필터 미사용. 전체 업체 대상으로 예측"
+    )
+
     return parser.parse_args()
 
 
@@ -194,7 +207,8 @@ def predict_single(
     top_k: int,
     min_similarity: float = None,
     json_output_path: str = None,
-    return_embeddings: bool = False
+    return_embeddings: bool = False,
+    use_industry_filter: bool = True
 ):
     """단일 Notice 예측"""
     result = predictor.predict_for_notice(
@@ -202,7 +216,8 @@ def predict_single(
         bidntceord=bidntceord,
         top_k=top_k,
         min_similarity=min_similarity,
-        return_embeddings=return_embeddings
+        return_embeddings=return_embeddings,
+        use_industry_filter=use_industry_filter
     )
 
     print("\n" + "=" * 80)
@@ -306,7 +321,8 @@ def predict_batch(
     batch_file: str,
     top_k: int,
     min_similarity: float = None,
-    output_file: str = None
+    output_file: str = None,
+    use_industry_filter: bool = True
 ):
     """배치 예측"""
     # CSV 파일 로드
@@ -325,7 +341,8 @@ def predict_batch(
         notice_ids=notice_ids,
         top_k=top_k,
         min_similarity=min_similarity,
-        show_progress=True
+        show_progress=True,
+        use_industry_filter=use_industry_filter
     )
 
     # 결과를 DataFrame으로 변환
@@ -395,6 +412,9 @@ def main():
         print("   또는 --no-vector-db 플래그를 사용하세요")
         sys.exit(1)
 
+    # 업종 필터 옵션 처리 (--no-industry-filter가 우선)
+    use_industry_filter = not args.no_industry_filter
+
     if not args.quiet:
         print("=" * 80)
         print("Two-Tower 모델 예측 시작")
@@ -405,6 +425,7 @@ def main():
         else:
             print(f"벡터 DB: 미사용 (DB에서 직접 생성)")
         print(f"Top-K: {args.top_k}")
+        print(f"업종 필터: {'사용' if use_industry_filter else '미사용'}")
         print(f"디바이스: {args.device}")
         print()
 
@@ -443,12 +464,20 @@ def main():
             args.top_k,
             args.min_similarity,
             json_output_path=args.json_output,
-            return_embeddings=args.return_embeddings
+            return_embeddings=args.return_embeddings,
+            use_industry_filter=use_industry_filter
         )
 
     elif args.batch:
         # 배치 예측
-        predict_batch(predictor, args.batch, args.top_k, args.min_similarity, args.output)
+        predict_batch(
+            predictor,
+            args.batch,
+            args.top_k,
+            args.min_similarity,
+            args.output,
+            use_industry_filter=use_industry_filter
+        )
 
     # 소요 시간
     elapsed = datetime.now() - start_time

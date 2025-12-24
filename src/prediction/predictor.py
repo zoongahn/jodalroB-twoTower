@@ -152,6 +152,53 @@ class TwoTowerPredictor:
             print(f"⚠️  업체명 조회 실패: {e}")
             return {}
 
+    def _get_eligible_companies_by_industry(
+        self,
+        bidntceno: str,
+        bidntceord: str
+    ) -> Optional[set]:
+        """
+        공고의 업종코드에 해당하는 참여가능 업체 목록 조회
+
+        Args:
+            bidntceno: 공고번호
+            bidntceord: 공고차수
+
+        Returns:
+            참여가능 업체의 bizno set, 업종코드가 없으면 None (전체 업체 대상)
+        """
+        # 1. 공고의 업종코드 조회
+        industry_query = f"""
+        SELECT lcnslmtnm_code
+        FROM public.notice_industry_type
+        WHERE bidntceno = '{bidntceno}' AND bidntceord = '{bidntceord}'
+        """
+        try:
+            industry_df = pd.read_sql(industry_query, self.db_engine)
+            if len(industry_df) == 0:
+                print(f"  ⚠️  공고 {bidntceno}-{bidntceord}에 업종코드가 없습니다. 전체 업체 대상으로 예측합니다.")
+                return None
+
+            industry_codes = industry_df['lcnslmtnm_code'].tolist()
+            print(f"  ✓ 공고 업종코드: {industry_codes} ({len(industry_codes)}개)")
+
+            # 2. 해당 업종코드의 업체 목록 조회
+            codes_str = "','".join(str(code) for code in industry_codes)
+            company_query = f"""
+            SELECT DISTINCT bizno
+            FROM public.company_industry_type
+            WHERE indstrytycd IN ('{codes_str}')
+            """
+            company_df = pd.read_sql(company_query, self.db_engine)
+            eligible_companies = set(company_df['bizno'].tolist())
+
+            print(f"  ✓ 참여가능 업체: {len(eligible_companies):,}개")
+            return eligible_companies
+
+        except Exception as e:
+            print(f"  ⚠️  업종 기반 업체 조회 실패: {e}. 전체 업체 대상으로 예측합니다.")
+            return None
+
     def _load_notice_from_db(
         self,
         bidntceno: str,
@@ -417,7 +464,8 @@ class TwoTowerPredictor:
         bidntceord: str,
         top_k: int = 10,
         min_similarity: float = None,
-        return_embeddings: bool = False
+        return_embeddings: bool = False,
+        use_industry_filter: bool = True
     ) -> Dict:
         """
         새로운 Notice에 대해 적합한 Company 추천
@@ -428,6 +476,9 @@ class TwoTowerPredictor:
             top_k: 반환할 상위 K개 Company (None이면 제한 없음)
             min_similarity: 최소 유사도 threshold (None이면 제한 없음)
             return_embeddings: 임베딩도 함께 반환할지 여부
+            use_industry_filter: 업종 필터 사용 여부 (기본값: True)
+                - True: 공고의 업종코드에 해당하는 업체만 대상으로 예측
+                - False: 전체 업체 대상으로 예측
 
         Returns:
             Dict: {
@@ -504,14 +555,30 @@ class TwoTowerPredictor:
 
             print(f"✓ Notice 임베딩 생성 완료: {notice_embedding_np.shape}")
 
-        # 2. Company 임베딩 준비
+        # 2. 업종 필터링 (선택적)
+        eligible_companies = None
+        if use_industry_filter:
+            print("2. 업종 기반 참여가능 업체 조회 중...")
+            eligible_companies = self._get_eligible_companies_by_industry(bidntceno, bidntceord)
+        else:
+            print("2. 업종 필터 미사용 - 전체 업체 대상")
+
+        # 3. Company 임베딩 준비
         if self.use_vector_db and self.vector_store is not None:
             # Vector DB에서 로드
-            print("2. Vector DB에서 Company 임베딩 로드 중...")
-            company_ids = self.vector_store.company_ids
+            print("3. Vector DB에서 Company 임베딩 로드 중...")
+            all_company_ids = self.vector_store.company_ids
+
+            # 업종 필터링 적용
+            if eligible_companies is not None:
+                company_ids = [cid for cid in all_company_ids if cid in eligible_companies]
+                print(f"  ✓ 업종 필터 적용: {len(all_company_ids):,} → {len(company_ids):,}개")
+            else:
+                company_ids = all_company_ids
+
             num_companies = len(company_ids)
 
-            # 모든 Company 임베딩을 행렬로 구성
+            # 필터링된 Company 임베딩을 행렬로 구성
             company_embeddings_matrix = np.zeros(
                 (num_companies, self.config['final_embedding_dim']),
                 dtype=np.float32
@@ -525,14 +592,25 @@ class TwoTowerPredictor:
             print(f"✓ Company 임베딩 로드 완료: {company_embeddings_matrix.shape}")
         else:
             # DB에서 직접 생성
-            print("2. DB에서 Company 데이터 로드 및 임베딩 생성 중...")
-            company_ids, company_embeddings_matrix = self._generate_all_company_embeddings(
+            print("3. DB에서 Company 데이터 로드 및 임베딩 생성 중...")
+            all_company_ids, all_company_embeddings = self._generate_all_company_embeddings(
                 batch_size=1024,
                 limit=None  # 전체 Company
             )
 
-        # 3. 유사도 계산 (코사인 유사도)
-        print("3. 유사도 계산 중...")
+            # 업종 필터링 적용
+            if eligible_companies is not None:
+                # 필터링된 인덱스 추출
+                filtered_indices = [i for i, cid in enumerate(all_company_ids) if cid in eligible_companies]
+                company_ids = [all_company_ids[i] for i in filtered_indices]
+                company_embeddings_matrix = all_company_embeddings[filtered_indices]
+                print(f"  ✓ 업종 필터 적용: {len(all_company_ids):,} → {len(company_ids):,}개")
+            else:
+                company_ids = all_company_ids
+                company_embeddings_matrix = all_company_embeddings
+
+        # 4. 유사도 계산 (코사인 유사도)
+        print("4. 유사도 계산 중...")
 
         # 디버깅: 임베딩 체크
         print(f"   Notice 임베딩: shape={notice_embedding_np.shape}, has_nan={np.isnan(notice_embedding_np).any()}, norm={np.linalg.norm(notice_embedding_np):.4f}")
@@ -547,7 +625,7 @@ class TwoTowerPredictor:
 
         print(f"✓ 유사도 계산 완료: min={similarities.min():.4f}, max={similarities.max():.4f}")
 
-        # 4. Top-K 추출 및 유사도 필터링
+        # 5. Top-K 추출 및 유사도 필터링
         filter_desc = []
         if top_k:
             filter_desc.append(f"Top-{top_k}")
@@ -555,7 +633,7 @@ class TwoTowerPredictor:
             filter_desc.append(f"유사도 >= {min_similarity}")
 
         filter_str = " & ".join(filter_desc) if filter_desc else "모든"
-        print(f"4. Company 추출 중 ({filter_str})...")
+        print(f"5. Company 추출 중 ({filter_str})...")
 
         # 유사도 기준 내림차순 정렬 (stable sort로 일관성 보장)
         sorted_indices = np.argsort(similarities, kind='stable')[::-1]
@@ -583,8 +661,8 @@ class TwoTowerPredictor:
         if len(top_k_companies) > 0:
             print(f"  유사도 범위: {top_k_companies[-1][1]:.4f} ~ {top_k_companies[0][1]:.4f}")
 
-        # 5. DB에서 공고명과 업체명 조회
-        print("\n5. 공고명 및 업체명 조회 중...")
+        # 6. DB에서 공고명과 업체명 조회
+        print("\n6. 공고명 및 업체명 조회 중...")
         notice_title = self._get_notice_title(bidntceno, bidntceord)
 
         # 업체명 일괄 조회
@@ -594,7 +672,7 @@ class TwoTowerPredictor:
         print(f"✓ 공고명 조회 완료: {'있음' if notice_title else '없음'}")
         print(f"✓ 업체명 조회 완료: {len(company_names)}/{len(company_id_list)}개")
 
-        # 6. 결과 구성
+        # 7. 결과 구성
         result = {
             'notice_id': notice_data['id'] if notice_embedding_np is not None and 'notice_data' in locals() else notice_id,
             'notice_title': notice_title,
@@ -620,7 +698,8 @@ class TwoTowerPredictor:
         notice_ids: List[Tuple[str, str]],
         top_k: int = 10,
         min_similarity: float = None,
-        show_progress: bool = True
+        show_progress: bool = True,
+        use_industry_filter: bool = True
     ) -> List[Dict]:
         """
         여러 Notice에 대해 배치 예측
@@ -630,6 +709,7 @@ class TwoTowerPredictor:
             top_k: 각 Notice에 대해 반환할 상위 K개 (None이면 제한 없음)
             min_similarity: 최소 유사도 threshold (None이면 제한 없음)
             show_progress: 진행 상황 표시 여부
+            use_industry_filter: 업종 필터 사용 여부 (기본값: True)
 
         Returns:
             예측 결과 리스트
@@ -645,7 +725,8 @@ class TwoTowerPredictor:
                     bidntceord=bidntceord,
                     top_k=top_k,
                     min_similarity=min_similarity,
-                    return_embeddings=False
+                    return_embeddings=False,
+                    use_industry_filter=use_industry_filter
                 )
                 results.append(result)
             except Exception as e:

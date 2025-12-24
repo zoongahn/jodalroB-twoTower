@@ -419,6 +419,19 @@ def main():
     print(f"Notice 피처: {len(schema.notice.categorical)}개 범주형, {len(schema.notice.numeric)}개 수치형")
     print(f"Company 피처: {len(schema.company.categorical)}개 범주형, {len(schema.company.numeric)}개 수치형")
 
+    # Resume 시 기존 preprocessor 로드
+    saved_preprocessor = None
+    if config.get("resume"):
+        checkpoint_path = Path(config["resume"])
+        preprocessor_path = checkpoint_path.parent / "preprocessor.pt"
+        if preprocessor_path.exists():
+            print(f"\n📦 저장된 Preprocessor 로드: {preprocessor_path}")
+            saved_preprocessor = torch.load(preprocessor_path, map_location=device, weights_only=False)
+            print(f"   ✅ Preprocessor 로드 완료 (projection 가중치 복원)")
+        else:
+            print(f"\n⚠️ Preprocessor 파일을 찾을 수 없습니다: {preprocessor_path}")
+            print("   새로운 Preprocessor가 생성됩니다.")
+
     # DataLoader 생성 (V2)
     print("\nDataLoader 생성 중... (PairLoaderV2 - EmbeddingBagCollection용)")
     train_loader, test_loader, metadata = create_pair_dataloaders(
@@ -438,6 +451,7 @@ def main():
         test_mode=config["test_mode"],
         use_parquet=config["use_parquet"],
         parquet_dir=config["parquet_dir"],
+        preprocessor=saved_preprocessor,  # Resume 시 기존 preprocessor 사용
     )
 
     # Streaming 모드에서는 len() 호출 불가
